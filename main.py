@@ -1,19 +1,14 @@
-import discord
 import requests
-import os
 import hashlib
+import os
+import json
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+MESSAGE_ID = os.getenv("MESSAGE_ID")
 WEBHOOK = os.getenv("MAKE_WEBHOOK")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-client = discord.Client(intents=intents)
-
-tracked_message_id = None
-last_hash = None
+HASH_FILE = "last_hash.txt"
 
 
 def normalize(text):
@@ -22,71 +17,51 @@ def normalize(text):
     return "\n".join(lines)
 
 
-def hash_text(text):
-    return hashlib.sha256(text.encode()).hexdigest()
+def load_hash():
+    if os.path.exists(HASH_FILE):
+        return open(HASH_FILE).read()
+    return None
 
 
-def is_apollo_message(message):
-    if not message.embeds:
-        return False
-    text = message.embeds[0].description or ""
-    return "Grid" in text
+def save_hash(h):
+    with open(HASH_FILE, "w") as f:
+        f.write(h)
 
 
-async def find_apollo():
-    global tracked_message_id
-    channel = client.get_channel(CHANNEL_ID)
+def get_message():
+    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages/{MESSAGE_ID}"
 
-    async for msg in channel.history(limit=20):
-        if is_apollo_message(msg):
-            tracked_message_id = msg.id
-            print("Tracking:", tracked_message_id)
-            return
+    headers = {
+        "Authorization": f"Bot {TOKEN}"
+    }
 
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    data = r.json()
 
-@client.event
-async def on_ready():
-    print("Connected")
-    await find_apollo()
+    embed = ""
+    if data.get("embeds"):
+        embed = data["embeds"][0].get("description", "")
 
-
-@client.event
-async def on_message(message):
-    global tracked_message_id
-
-    if message.channel.id != CHANNEL_ID:
-        return
-
-    if is_apollo_message(message):
-        tracked_message_id = message.id
-        print("Switched tracking")
+    return embed
 
 
-@client.event
-async def on_raw_message_edit(payload):
-    global last_hash
-
-    if payload.message_id != tracked_message_id:
-        return
-
-    channel = client.get_channel(CHANNEL_ID)
-    message = await channel.fetch_message(tracked_message_id)
-
-    text = message.embeds[0].description or ""
+def main():
+    text = get_message()
     normalized = normalize(text)
-    new_hash = hash_text(normalized)
 
-    if new_hash == last_hash:
+    new_hash = hashlib.sha256(normalized.encode()).hexdigest()
+    old_hash = load_hash()
+
+    if new_hash == old_hash:
         print("No change")
         return
 
-    last_hash = new_hash
+    save_hash(new_hash)
 
-    try:
-        requests.post(WEBHOOK, json={"apollo": normalized}, timeout=5)
-        print("Webhook sent")
-    except Exception as e:
-        print("Webhook error:", e)
+    requests.post(WEBHOOK, json={"apollo": normalized})
+    print("Change detected → webhook sent")
 
 
-client.run(TOKEN)
+if __name__ == "__main__":
+    main()
