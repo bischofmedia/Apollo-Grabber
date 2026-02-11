@@ -1,11 +1,9 @@
 import requests
 import hashlib
 import os
-import json
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-MESSAGE_ID = os.getenv("MESSAGE_ID")
 WEBHOOK = os.getenv("MAKE_WEBHOOK")
 
 HASH_FILE = "last_hash.txt"
@@ -28,26 +26,39 @@ def save_hash(h):
         f.write(h)
 
 
-def get_message():
-    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages/{MESSAGE_ID}"
+def is_apollo(msg):
+    if not msg.get("embeds"):
+        return False
 
-    headers = {
-        "Authorization": f"Bot {TOKEN}"
-    }
+    text = msg["embeds"][0].get("description", "")
+
+    keywords = ["Grid", "Driver", "Anmeldung"]
+
+    return any(k in text for k in keywords)
+
+
+def find_apollo_message():
+    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?limit=20"
+
+    headers = {"Authorization": f"Bot {TOKEN}"}
 
     r = requests.get(url, headers=headers)
     r.raise_for_status()
-    data = r.json()
 
-    embed = ""
-    if data.get("embeds"):
-        embed = data["embeds"][0].get("description", "")
+    for msg in r.json():
+        if is_apollo(msg):
+            return msg["embeds"][0].get("description", "")
 
-    return embed
+    return ""
 
 
 def main():
-    text = get_message()
+    text = find_apollo_message()
+
+    if not text:
+        print("Apollo message not found")
+        return
+
     normalized = normalize(text)
 
     new_hash = hashlib.sha256(normalized.encode()).hexdigest()
