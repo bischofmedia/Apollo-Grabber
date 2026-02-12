@@ -40,13 +40,19 @@ def hash_text(text):
 # ---------- Apollo detection ----------
 
 def is_apollo(msg):
-    if not msg.get("embeds"):
+
+    embeds = msg.get("embeds", [])
+    if not embeds:
         return False
 
-    text = msg["embeds"][0].get("description", "")
-    keywords = ["Grid", "Driver", "Anmeldung"]
+    desc = embeds[0].get("description", "")
+    if not desc:
+        return False
 
-    return any(k in text for k in keywords)
+    # Apollo messages always contain multiple lines (roster layout)
+    lines = [l.strip() for l in desc.split("\n") if l.strip()]
+
+    return len(lines) >= 3
 
 
 def fetch_messages():
