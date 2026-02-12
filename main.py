@@ -12,9 +12,12 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 WEBHOOK = os.getenv("MAKE_WEBHOOK")
 
+# Neue Umgebungsvariablen mit Fallback-Werten
+DRIVERS_PER_GRID = int(os.getenv("DRIVERS_PER_GRID", 15))
+MAX_GRIDS = int(os.getenv("MAX_GRIDS", 4))
+
 STATE_FILE = "state.json"
 APOLLO_BOT_ID = "475744554910351370"
-DRIVERS_PER_GRID = 15  # Festwert basierend auf Gran Turismo
 
 # ---------- Helpers ----------
 
@@ -44,37 +47,37 @@ def fetch_messages():
     return r.json()
 
 def extract_data_from_embed(embed):
-    """
-    Sammelt alle Fahrer aus den Fields und berechnet die Grids basierend auf 15er Schritten.
-    """
     fields = embed.get("fields", [])
     all_drivers = []
     full_text_for_hash = ""
     
-    # Wir loopen durch alle Fields (Field[0] ist oft Beschreibung, Rest sind Fahrerlisten)
     for field in fields:
         name = field.get("name", "")
         value = field.get("value", "")
-        
-        # Alles für den Hash sammeln, um jede Änderung (auch Status-Wechsel) zu bemerken
         full_text_for_hash += f"{name}{value}"
         
-        # Nur Fields verarbeiten, die tatsächlich Fahrerlisten enthalten 
-        # (Apollo nutzt oft Emojis wie :white_check_mark: oder Namen wie "Accepted")
-        if any(keyword in name for keyword in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed"]):
+        # Wir suchen gezielt in Feldern, die Teilnehmerlisten enthalten
+        if any(keyword in name for keyword in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
-                # Entferne Discord-Erwähnungen <@...>, Sternchen, etc.
+                # Reinigung von Discord-Steuerzeichen
                 clean_name = re.sub(r"[*<>@!]", "", line)
-                # Entferne führende Nummern oder Punkte (z.B. "1. Name" -> "Name")
-                clean_name = re.sub(r"^\d+\.\s*", "", clean_name)
+                # Entferne Nummerierungen wie "1. ", "01) " etc.
+                clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name)
                 
-                if clean_name:
+                if clean_name and "Grid" not in clean_name:
                     all_drivers.append(clean_name)
 
-    # Berechnung der Grids: Immer aufgerundet auf Basis von 15
     driver_count = len(all_drivers)
-    grids_needed = math.ceil(driver_count / DRIVERS_PER_GRID) if driver_count > 0 else 0
+    
+    # Grid-Berechnung basierend auf den Variablen
+    if driver_count == 0:
+        grids_needed = 0
+    else:
+        grids_needed = math.ceil(driver_count / DRIVERS_PER_GRID)
+        # Begrenzung auf das Maximum
+        if grids_needed > MAX_GRIDS:
+            grids_needed = MAX_GRIDS
 
     return all_drivers, grids_needed, full_text_for_hash
 
@@ -83,9 +86,7 @@ def extract_data_from_embed(embed):
 def grid_locked():
     berlin = ZoneInfo("Europe/Berlin")
     now = datetime.now(berlin)
-    wd = now.weekday()  # Mon=0, Sun=6
-    
-    # Sperrzeiten: Sonntag ab 18 Uhr, ganzer Montag, Dienstag bis 10 Uhr
+    wd = now.weekday()
     if (wd == 6 and now.hour >= 18) or (wd == 0) or (wd == 1 and now.hour < 10):
         return True
     return False
@@ -93,7 +94,7 @@ def grid_locked():
 def send_webhook(payload):
     try:
         requests.post(WEBHOOK, json=payload, timeout=5)
-        print(f"Webhook gesendet: {payload['type']} ({payload['driver_count']} Fahrer, {payload['grids']} Grids)")
+        print(f"Webhook: {payload['type']} | {payload['driver_count']} Fahrer | {payload['grids']} Grids")
     except Exception as e:
         print(f"Webhook Fehler: {e}")
 
@@ -104,7 +105,7 @@ def run_check():
     try:
         messages = fetch_messages()
     except Exception as e:
-        print(f"Fehler beim Abrufen der Nachrichten: {e}")
+        print(f"Discord API Fehler: {e}")
         return {"status": "error"}
     
     apollo_msg = None
@@ -114,4 +115,55 @@ def run_check():
             break
             
     if not apollo_msg:
-        return {"status": "no_event
+        return {"status": "no_event"}
+
+    event_id = apollo_msg["id"]
+    embed = apollo_msg["embeds"][0]
+    
+    drivers, grids, raw_content = extract_data_from_embed(embed)
+    new_hash = hash_text(raw_content)
+    
+    berlin = ZoneInfo("Europe/Berlin")
+    payload_base = {
+        "event_id": event_id,
+        "drivers": drivers,
+        "driver_count": len(drivers),
+        "grids": grids,
+        "grid_locked": grid_locked(),
+        "timestamp": datetime.now(berlin).isoformat()
+    }
+
+    if state["event_id"] != event_id:
+        p_type = "event_reset_with_roster" if drivers else "event_reset"
+        payload = {"type": p_type, **payload_base}
+        send_webhook(payload)
+        save_state({"event_id": event_id, "hash": new_hash})
+        return {"status": "new_event_detected"}
+
+    if state["hash"] != new_hash:
+        payload = {"type": "roster_update", **payload_base}
+        send_webhook(payload)
+        state["hash"] = new_hash
+        save_state(state)
+        return {"status": "roster_updated"}
+
+    return {"status": "no_change"}
+
+# ---------- Server ----------
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        result = run_check()
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode())
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    print(f"Apollo Grabber V2 aktiv (Limit: {MAX_GRIDS} Grids à {DRIVERS_PER_GRID} Fahrer)")
+    HTTPServer(("", port), Handler).serve_forever()
