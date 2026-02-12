@@ -40,19 +40,19 @@ def hash_text(text):
 # ---------- Apollo detection ----------
 
 def is_apollo(msg):
+    # Prüfe, ob die Nachricht vom Apollo-Bot kommt
+    # Die ID wird in der API-Antwort unter ['author']['id'] geliefert
+    author = msg.get("author", {})
+    if author.get("id") != "475744554910351370":
+        return False
 
     embeds = msg.get("embeds", [])
     if not embeds:
         return False
 
+    # Ein kurzer Check, ob eine Description da ist, reicht jetzt aus
     desc = embeds[0].get("description", "")
-    if not desc:
-        return False
-
-    # Apollo messages always contain multiple lines (roster layout)
-    lines = [l.strip() for l in desc.split("\n") if l.strip()]
-
-    return len(lines) >= 3
+    return len(desc) > 0
 
 
 def fetch_messages():
