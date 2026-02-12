@@ -3,6 +3,7 @@ import hashlib
 import os
 import json
 import re
+import math
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,6 +14,7 @@ WEBHOOK = os.getenv("MAKE_WEBHOOK")
 
 STATE_FILE = "state.json"
 APOLLO_BOT_ID = "475744554910351370"
+DRIVERS_PER_GRID = 15  # Festwert basierend auf Gran Turismo
 
 # ---------- Helpers ----------
 
@@ -43,36 +45,38 @@ def fetch_messages():
 
 def extract_data_from_embed(embed):
     """
-    Extrahiert Fahrer aus Fields und sucht nach Grid-Limit im gesamten Text.
+    Sammelt alle Fahrer aus den Fields und berechnet die Grids basierend auf 15er Schritten.
     """
     fields = embed.get("fields", [])
     all_drivers = []
     full_text_for_hash = ""
     
-    # 1. Fahrer-Extraktion aus den Fields (ab Field[1] laut deiner Erfahrung)
-    # Wir nehmen zur Sicherheit alle Fields, die Namen im Discord-Format (@...) enthalten
+    # Wir loopen durch alle Fields (Field[0] ist oft Beschreibung, Rest sind Fahrerlisten)
     for field in fields:
+        name = field.get("name", "")
         value = field.get("value", "")
-        full_text_for_hash += f"{field.get('name', '')}{value}"
         
-        # Extrahiere Namen: Apollo listet Fahrer oft mit Zeilenumbrüchen auf
-        # Wir filtern Zeilen, die wie User-Erwähnungen oder Namen aussehen
-        lines = [l.strip() for l in value.split("\n") if l.strip()]
-        for line in lines:
-            # Einfache Reinigung von Discord-Markdown (Fett, Kursiv, Mentions)
-            clean_name = re.sub(r"[*<>@!]", "", line)
-            if clean_name and "Grid" not in clean_name:
-                all_drivers.append(clean_name)
+        # Alles für den Hash sammeln, um jede Änderung (auch Status-Wechsel) zu bemerken
+        full_text_for_hash += f"{name}{value}"
+        
+        # Nur Fields verarbeiten, die tatsächlich Fahrerlisten enthalten 
+        # (Apollo nutzt oft Emojis wie :white_check_mark: oder Namen wie "Accepted")
+        if any(keyword in name for keyword in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed"]):
+            lines = [l.strip() for l in value.split("\n") if l.strip()]
+            for line in lines:
+                # Entferne Discord-Erwähnungen <@...>, Sternchen, etc.
+                clean_name = re.sub(r"[*<>@!]", "", line)
+                # Entferne führende Nummern oder Punkte (z.B. "1. Name" -> "Name")
+                clean_name = re.sub(r"^\d+\.\s*", "", clean_name)
+                
+                if clean_name:
+                    all_drivers.append(clean_name)
 
-    # 2. Grid-Limit Suche (z.B. "0/22" oder "Limit: 22")
-    # Wir scannen Titel, Description und alle Field-Namen
-    search_area = f"{embed.get('title', '')} {embed.get('description', '')} "
-    search_area += " ".join([f.get("name", "") for f in fields])
-    
-    grid_match = re.search(r"/(\d{2})", search_area) # Sucht nach /22, /20 etc.
-    max_grid = int(grid_match.group(1)) if grid_match else 15
+    # Berechnung der Grids: Immer aufgerundet auf Basis von 15
+    driver_count = len(all_drivers)
+    grids_needed = math.ceil(driver_count / DRIVERS_PER_GRID) if driver_count > 0 else 0
 
-    return all_drivers, max_grid, full_text_for_hash
+    return all_drivers, grids_needed, full_text_for_hash
 
 # ---------- Business Logic ----------
 
@@ -80,6 +84,8 @@ def grid_locked():
     berlin = ZoneInfo("Europe/Berlin")
     now = datetime.now(berlin)
     wd = now.weekday()  # Mon=0, Sun=6
+    
+    # Sperrzeiten: Sonntag ab 18 Uhr, ganzer Montag, Dienstag bis 10 Uhr
     if (wd == 6 and now.hour >= 18) or (wd == 0) or (wd == 1 and now.hour < 10):
         return True
     return False
@@ -87,7 +93,7 @@ def grid_locked():
 def send_webhook(payload):
     try:
         requests.post(WEBHOOK, json=payload, timeout=5)
-        print(f"Webhook gesendet: {payload['type']}")
+        print(f"Webhook gesendet: {payload['type']} ({payload['driver_count']} Fahrer, {payload['grids']} Grids)")
     except Exception as e:
         print(f"Webhook Fehler: {e}")
 
@@ -95,7 +101,11 @@ def send_webhook(payload):
 
 def run_check():
     state = load_state()
-    messages = fetch_messages()
+    try:
+        messages = fetch_messages()
+    except Exception as e:
+        print(f"Fehler beim Abrufen der Nachrichten: {e}")
+        return {"status": "error"}
     
     apollo_msg = None
     for msg in messages:
@@ -104,57 +114,4 @@ def run_check():
             break
             
     if not apollo_msg:
-        return {"status": "no_event"}
-
-    event_id = apollo_msg["id"]
-    embed = apollo_msg["embeds"][0]
-    
-    drivers, grids, raw_content = extract_data_from_embed(embed)
-    new_hash = hash_text(raw_content)
-    
-    berlin = ZoneInfo("Europe/Berlin")
-    payload_base = {
-        "event_id": event_id,
-        "drivers": drivers,
-        "driver_count": len(drivers),
-        "grids": grids,
-        "grid_locked": grid_locked(),
-        "timestamp": datetime.now(berlin).isoformat()
-    }
-
-    # Fall 1: Neues Event entdeckt
-    if state["event_id"] != event_id:
-        p_type = "event_reset_with_roster" if drivers else "event_reset"
-        payload = {"type": p_type, **payload_base}
-        send_webhook(payload)
-        save_state({"event_id": event_id, "hash": new_hash})
-        return {"status": "new_event_detected"}
-
-    # Fall 2: Roster-Update (Hash hat sich geändert)
-    if state["hash"] != new_hash:
-        payload = {"type": "roster_update", **payload_base}
-        send_webhook(payload)
-        state["hash"] = new_hash
-        save_state(state)
-        return {"status": "roster_updated"}
-
-    return {"status": "no_change"}
-
-# ---------- Server ----------
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        result = run_check()
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode())
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    print(f"Server läuft auf Port {port}...")
-    HTTPServer(("", port), Handler).serve_forever()
+        return {"status": "no_event
