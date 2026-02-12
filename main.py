@@ -148,7 +148,25 @@ def run_check():
         }
         send_webhook(payload)
         save_state({"event_id": event_id, "hash": new_hash, "drivers": drivers})
-        return {"status": "roster_updated"}
+        return {"status": "roster_updated"}# ---------- Server ----------
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        result = run_check()
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode())
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+if __name__ == "__main__":
+    # Hier lag der Fehler (Klammer nicht geschlossen)
+    port = int(os.getenv("PORT", 10000))
+    print(f"Apollo Grabber V2 aktiv (Grids: 1-{MAX_GRIDS}, Drivers/Grid: {DRIVERS_PER_GRID})")
+    HTTPServer(("", port), Handler).serve_forever()
 
     return {"status": "no_change"}
 
@@ -167,4 +185,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT",
+    # Port aus Umgebungsvariable lesen (Standard 10000 für Render)
+    port = int(os.getenv("PORT", 10000))
+    
+    # Bestätigung im Log ausgeben
+    print(f"Apollo Grabber V2 aktiv (Grids: 1-{MAX_GRIDS}, Drivers/Grid: {DRIVERS_PER_GRID})")
+    
+    # Server initialisieren und dauerhaft laufen lassen
+    server = HTTPServer(("", port), Handler)
+    server.serve_forever()
