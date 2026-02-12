@@ -148,9 +148,18 @@ def run_check():
         }
         send_webhook(payload)
         save_state({"event_id": event_id, "hash": new_hash, "drivers": drivers})
-        return {"status": "roster_updated"}
+        # Hier geben wir die Details nun auch an den Browser zurück:
+        return {
+            "status": "roster_updated",
+            "added": added,
+            "removed": removed,
+            "count": len(drivers)
+        }
 
-    return {"status": "no_change"}
+    return {
+        "status": "no_change",
+        "current_driver_count": len(drivers)
+    }
 
 # ---------- Server ----------
 
