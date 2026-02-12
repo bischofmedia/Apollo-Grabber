@@ -3,6 +3,8 @@ import hashlib
 import os
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
@@ -35,6 +37,8 @@ def hash_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+# ---------- Apollo detection ----------
+
 def is_apollo(msg):
     if not msg.get("embeds"):
         return False
@@ -48,7 +52,6 @@ def is_apollo(msg):
 def fetch_messages():
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?limit=20"
     headers = {"Authorization": f"Bot {TOKEN}"}
-
     r = requests.get(url, headers=headers)
     r.raise_for_status()
     return r.json()
@@ -59,19 +62,47 @@ def find_apollo():
         if is_apollo(msg):
             desc = msg["embeds"][0].get("description", "")
             return msg["id"], desc
-
     return None, None
+
+
+# ---------- Business logic ----------
+
+def parse_drivers(text):
+    return [l for l in text.split("\n") if l.strip()]
+
+
+def calc_grids(count):
+    import math
+    return math.ceil(count / 15)
+
+
+def grid_locked():
+    berlin = ZoneInfo("Europe/Berlin")
+    now = datetime.now(berlin)
+
+    wd = now.weekday()  # Mon=0
+
+    if wd == 6 and now.hour >= 18:  # Sunday
+        return True
+
+    if wd == 0:  # Monday
+        return True
+
+    if wd == 1 and now.hour < 10:  # Tuesday
+        return True
+
+    return False
 
 
 def send_webhook(payload):
     try:
         requests.post(WEBHOOK, json=payload, timeout=5)
-        print("Webhook sent:", payload["type"])
+        print("Webhook:", payload["type"])
     except Exception as e:
         print("Webhook error:", e)
 
 
-# ---------- Core Poll Logic ----------
+# ---------- Core check ----------
 
 def run_check():
 
@@ -85,30 +116,36 @@ def run_check():
     normalized = normalize(raw_text)
     new_hash = hash_text(normalized)
 
+    drivers = parse_drivers(normalized)
+    driver_count = len(drivers)
+    grids = calc_grids(driver_count)
+
+    berlin = ZoneInfo("Europe/Berlin")
+    timestamp = datetime.now(berlin).isoformat()
+
+    base_payload = {
+        "event_id": event_id,
+        "drivers": drivers,
+        "driver_count": driver_count,
+        "grids": grids,
+        "grid_locked": grid_locked(),
+        "timestamp": timestamp
+    }
+
     # New event
     if state["event_id"] != event_id:
 
-        send_webhook({
-            "type": "event_reset",
-            "event_id": event_id,
-            "apollo": normalized
-        })
+        payload = {"type": "event_reset", **base_payload}
+        send_webhook(payload)
 
-        save_state({
-            "event_id": event_id,
-            "hash": new_hash
-        })
-
+        save_state({"event_id": event_id, "hash": new_hash})
         return {"status": "event_reset"}
 
     # Roster change
     if state["hash"] != new_hash:
 
-        send_webhook({
-            "type": "roster_update",
-            "event_id": event_id,
-            "apollo": normalized
-        })
+        payload = {"type": "roster_update", **base_payload}
+        send_webhook(payload)
 
         state["hash"] = new_hash
         save_state(state)
@@ -118,7 +155,7 @@ def run_check():
     return {"status": "no_change"}
 
 
-# ---------- HTTP Server ----------
+# ---------- HTTP server ----------
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -134,5 +171,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    print(f"Server running on port {port}")
+    print("Server running…")
     HTTPServer(("", port), Handler).serve_forever()
