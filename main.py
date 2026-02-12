@@ -64,9 +64,15 @@ def extract_data_from_embed(embed):
         if any(keyword in name for keyword in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
+                # 1. Sonderzeichen entfernen
                 clean_name = re.sub(r"[*<>@!]", "", line)
+                # 2. Nummerierung am Anfang entfernen
                 clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name)
-                if clean_name and "Grid" not in clean_name:
+                # 3. Leerzeichen außen entfernen
+                clean_name = clean_name.strip()
+                
+                # Nur hinzufügen, wenn Name existiert, nicht "Grid" ist und mehr als 1 Zeichen hat
+                if clean_name and "Grid" not in clean_name and len(clean_name) > 1:
                     all_drivers.append(clean_name)
 
     driver_count = len(all_drivers)
