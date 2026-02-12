@@ -132,16 +132,24 @@ def run_check():
         "timestamp": timestamp
     }
 
-    # New event
+    # ---------- NEW EVENT ----------
+
     if state["event_id"] != event_id:
 
-        payload = {"type": "event_reset", **base_payload}
+        if driver_count > 0:
+            payload_type = "event_reset_with_roster"
+        else:
+            payload_type = "event_reset"
+
+        payload = {"type": payload_type, **base_payload}
         send_webhook(payload)
 
         save_state({"event_id": event_id, "hash": new_hash})
-        return {"status": "event_reset"}
 
-    # Roster change
+        return {"status": payload_type}
+
+    # ---------- ROSTER UPDATE ----------
+
     if state["hash"] != new_hash:
 
         payload = {"type": "roster_update", **base_payload}
@@ -153,7 +161,6 @@ def run_check():
         return {"status": "roster_update"}
 
     return {"status": "no_change"}
-
 
 # ---------- HTTP server ----------
 
