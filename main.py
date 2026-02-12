@@ -180,6 +180,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         self.wfile.write(json.dumps(result).encode())
+     
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 
 if __name__ == "__main__":
