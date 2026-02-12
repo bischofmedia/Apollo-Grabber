@@ -12,7 +12,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 WEBHOOK = os.getenv("MAKE_WEBHOOK")
 
-# Neue Umgebungsvariablen mit Fallback-Werten
+# Umgebungsvariablen mit Fallback-Werten
 DRIVERS_PER_GRID = int(os.getenv("DRIVERS_PER_GRID", 15))
 MAX_GRIDS = int(os.getenv("MAX_GRIDS", 4))
 
@@ -56,13 +56,11 @@ def extract_data_from_embed(embed):
         value = field.get("value", "")
         full_text_for_hash += f"{name}{value}"
         
-        # Wir suchen gezielt in Feldern, die Teilnehmerlisten enthalten
+        # Suche in Teilnehmer-Feldern
         if any(keyword in name for keyword in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
-                # Reinigung von Discord-Steuerzeichen
                 clean_name = re.sub(r"[*<>@!]", "", line)
-                # Entferne Nummerierungen wie "1. ", "01) " etc.
                 clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name)
                 
                 if clean_name and "Grid" not in clean_name:
@@ -70,14 +68,13 @@ def extract_data_from_embed(embed):
 
     driver_count = len(all_drivers)
     
-    # Grid-Berechnung basierend auf den Variablen
-    if driver_count == 0:
-        grids_needed = 0
-    else:
-        grids_needed = math.ceil(driver_count / DRIVERS_PER_GRID)
-        # Begrenzung auf das Maximum
-        if grids_needed > MAX_GRIDS:
-            grids_needed = MAX_GRIDS
+    # Grid-Berechnung: Mindestens 1, maximal MAX_GRIDS
+    grids_needed = math.ceil(driver_count / DRIVERS_PER_GRID)
+    
+    if grids_needed < 1:
+        grids_needed = 1
+    elif grids_needed > MAX_GRIDS:
+        grids_needed = MAX_GRIDS
 
     return all_drivers, grids_needed, full_text_for_hash
 
@@ -112,58 +109,3 @@ def run_check():
     for msg in messages:
         if msg.get("author", {}).get("id") == APOLLO_BOT_ID and msg.get("embeds"):
             apollo_msg = msg
-            break
-            
-    if not apollo_msg:
-        return {"status": "no_event"}
-
-    event_id = apollo_msg["id"]
-    embed = apollo_msg["embeds"][0]
-    
-    drivers, grids, raw_content = extract_data_from_embed(embed)
-    new_hash = hash_text(raw_content)
-    
-    berlin = ZoneInfo("Europe/Berlin")
-    payload_base = {
-        "event_id": event_id,
-        "drivers": drivers,
-        "driver_count": len(drivers),
-        "grids": grids,
-        "grid_locked": grid_locked(),
-        "timestamp": datetime.now(berlin).isoformat()
-    }
-
-    if state["event_id"] != event_id:
-        p_type = "event_reset_with_roster" if drivers else "event_reset"
-        payload = {"type": p_type, **payload_base}
-        send_webhook(payload)
-        save_state({"event_id": event_id, "hash": new_hash})
-        return {"status": "new_event_detected"}
-
-    if state["hash"] != new_hash:
-        payload = {"type": "roster_update", **payload_base}
-        send_webhook(payload)
-        state["hash"] = new_hash
-        save_state(state)
-        return {"status": "roster_updated"}
-
-    return {"status": "no_change"}
-
-# ---------- Server ----------
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        result = run_check()
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode())
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    print(f"Apollo Grabber V2 aktiv (Limit: {MAX_GRIDS} Grids à {DRIVERS_PER_GRID} Fahrer)")
-    HTTPServer(("", port), Handler).serve_forever()
