@@ -1,13 +1,16 @@
 import requests
 import hashlib
 import os
+import json
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 WEBHOOK = os.getenv("MAKE_WEBHOOK")
 
-HASH_FILE = "last_hash.txt"
+STATE_FILE = "state.json"
 
+
+# ---------- Helpers ----------
 
 def normalize(text):
     lines = [l.strip() for l in text.split("\n")]
@@ -15,63 +18,112 @@ def normalize(text):
     return "\n".join(lines)
 
 
-def load_hash():
-    if os.path.exists(HASH_FILE):
-        return open(HASH_FILE).read()
-    return None
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"event_id": None, "hash": None}
 
 
-def save_hash(h):
-    with open(HASH_FILE, "w") as f:
-        f.write(h)
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
+
+def hash_text(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+# ---------- Apollo Detection ----------
 
 def is_apollo(msg):
     if not msg.get("embeds"):
         return False
 
     text = msg["embeds"][0].get("description", "")
-
     keywords = ["Grid", "Driver", "Anmeldung"]
 
     return any(k in text for k in keywords)
 
 
-def find_apollo_message():
+def fetch_messages():
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?limit=20"
-
     headers = {"Authorization": f"Bot {TOKEN}"}
 
     r = requests.get(url, headers=headers)
     r.raise_for_status()
 
-    for msg in r.json():
-        if is_apollo(msg):
-            return msg["embeds"][0].get("description", "")
+    return r.json()
 
-    return ""
+
+def find_apollo():
+    for msg in fetch_messages():
+        if is_apollo(msg):
+            desc = msg["embeds"][0].get("description", "")
+            return msg["id"], desc
+
+    return None, None
+
+
+# ---------- Main Logic ----------
+
+def send_webhook(payload):
+    try:
+        requests.post(WEBHOOK, json=payload, timeout=5)
+        print("Webhook sent:", payload["type"])
+    except Exception as e:
+        print("Webhook error:", e)
 
 
 def main():
-    text = find_apollo_message()
 
-    if not text:
-        print("Apollo message not found")
+    state = load_state()
+
+    event_id, raw_text = find_apollo()
+
+    # --- No Apollo Event ---
+    if not event_id:
+        print("No Apollo event found — exiting safely")
         return
 
-    normalized = normalize(text)
+    normalized = normalize(raw_text)
+    new_hash = hash_text(normalized)
 
-    new_hash = hashlib.sha256(normalized.encode()).hexdigest()
-    old_hash = load_hash()
+    # --- New Event Detected ---
+    if state["event_id"] != event_id:
 
-    if new_hash == old_hash:
-        print("No change")
+        print("New Apollo event detected")
+
+        send_webhook({
+            "type": "event_reset",
+            "event_id": event_id,
+            "apollo": normalized
+        })
+
+        save_state({
+            "event_id": event_id,
+            "hash": new_hash
+        })
+
         return
 
-    save_hash(new_hash)
+    # --- Roster Update ---
+    if state["hash"] != new_hash:
 
-    requests.post(WEBHOOK, json={"apollo": normalized})
-    print("Change detected → webhook sent")
+        print("Roster change detected")
+
+        send_webhook({
+            "type": "roster_update",
+            "event_id": event_id,
+            "apollo": normalized
+        })
+
+        state["hash"] = new_hash
+        save_state(state)
+
+        return
+
+    print("No change — exiting")
 
 
 if __name__ == "__main__":
