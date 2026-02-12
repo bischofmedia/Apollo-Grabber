@@ -100,6 +100,10 @@ def send_webhook(payload):
 
 def run_check():
     state = load_state()
+    
+    # Log zur Diagnose (erscheint in Render Logs)
+    print(f"DEBUG: Geladene Event-ID aus State: {state.get('event_id')}")
+
     try:
         messages = fetch_messages()
     except Exception as e:
@@ -115,9 +119,11 @@ def run_check():
     if not apollo_msg:
         return {"status": "no_event"}
 
-    event_id = apollo_msg["id"]
-    embed = apollo_msg["embeds"][0]
+    # WICHTIG: Sicherstellen, dass IDs als Strings verglichen werden
+    event_id = str(apollo_msg["id"])
+    last_event_id = str(state.get("event_id")) if state.get("event_id") else None
     
+    embed = apollo_msg["embeds"][0]
     drivers, grids, raw_content = extract_data_from_embed(embed)
     new_hash = hash_text(raw_content)
     
@@ -131,14 +137,24 @@ def run_check():
         "timestamp": datetime.now(berlin).isoformat()
     }
 
-    if state["event_id"] != event_id:
+    # FALL 1: WIRKLICH ein neues Event (ID unterscheidet sich von gespeichertem String)
+    if last_event_id != event_id:
+        print(f"DEBUG: NEUES EVENT ERKANNT. Alt: {last_event_id} | Neu: {event_id}")
         p_type = "event_reset_with_roster" if drivers else "event_reset"
         payload = {"type": p_type, **payload_base}
         send_webhook(payload)
+        
+        # Sofort speichern
         save_state({"event_id": event_id, "hash": new_hash, "drivers": drivers})
-        return {"status": "new_event_detected"}
+        
+        return {
+            "status": "new_event_detected",
+            "type": p_type,
+            "event_id": event_id
+        }
 
-    if state["hash"] != new_hash:
+    # FALL 2: Roster Update (ID ist gleich, aber Inhalt anders)
+    if state.get("hash") != new_hash:
         added, removed = get_roster_changes(state.get("drivers", []), drivers)
         payload = {
             "type": "roster_update", 
@@ -147,18 +163,18 @@ def run_check():
             **payload_base
         }
         send_webhook(payload)
+        
         save_state({"event_id": event_id, "hash": new_hash, "drivers": drivers})
-        # Hier geben wir die Details nun auch an den Browser zurück:
         return {
             "status": "roster_updated",
             "added": added,
-            "removed": removed,
-            "count": len(drivers)
+            "removed": removed
         }
 
     return {
         "status": "no_change",
-        "current_driver_count": len(drivers)
+        "event_id": event_id,
+        "driver_count": len(drivers)
     }
 
 # ---------- Server ----------
