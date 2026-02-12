@@ -2,6 +2,7 @@ import requests
 import hashlib
 import os
 import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
@@ -34,8 +35,6 @@ def hash_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-# ---------- Apollo Detection ----------
-
 def is_apollo(msg):
     if not msg.get("embeds"):
         return False
@@ -52,7 +51,6 @@ def fetch_messages():
 
     r = requests.get(url, headers=headers)
     r.raise_for_status()
-
     return r.json()
 
 
@@ -65,8 +63,6 @@ def find_apollo():
     return None, None
 
 
-# ---------- Main Logic ----------
-
 def send_webhook(payload):
     try:
         requests.post(WEBHOOK, json=payload, timeout=5)
@@ -75,24 +71,22 @@ def send_webhook(payload):
         print("Webhook error:", e)
 
 
-def main():
+# ---------- Core Poll Logic ----------
+
+def run_check():
 
     state = load_state()
 
     event_id, raw_text = find_apollo()
 
-    # --- No Apollo Event ---
     if not event_id:
-        print("No Apollo event found — exiting safely")
-        return
+        return {"status": "no_event"}
 
     normalized = normalize(raw_text)
     new_hash = hash_text(normalized)
 
-    # --- New Event Detected ---
+    # New event
     if state["event_id"] != event_id:
-
-        print("New Apollo event detected")
 
         send_webhook({
             "type": "event_reset",
@@ -105,12 +99,10 @@ def main():
             "hash": new_hash
         })
 
-        return
+        return {"status": "event_reset"}
 
-    # --- Roster Update ---
+    # Roster change
     if state["hash"] != new_hash:
-
-        print("Roster change detected")
 
         send_webhook({
             "type": "roster_update",
@@ -121,10 +113,26 @@ def main():
         state["hash"] = new_hash
         save_state(state)
 
-        return
+        return {"status": "roster_update"}
 
-    print("No change — exiting")
+    return {"status": "no_change"}
+
+
+# ---------- HTTP Server ----------
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+
+        result = run_check()
+
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+
+        self.wfile.write(json.dumps(result).encode())
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", 10000))
+    print(f"Server running on port {port}")
+    HTTPServer(("", port), Handler).serve_forever()
