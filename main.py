@@ -40,6 +40,10 @@ def grid_locked():
         return True
     return False
 
+def clean_log_name(name):
+    """Bereinigt Namen NUR für die Anzeige im Text-Log."""
+    return name.replace("\\_", "_").replace("\\*", "*").replace("*", "").replace("_", " ").strip()
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -65,8 +69,8 @@ def extract_data_from_embed(embed):
         if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
-                clean_name = re.sub(r"[*_<>@!]", "", line)
-                clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name).strip()
+                # KEINE BEREINIGUNG MEHR: Wir nehmen den Namen, wie Apollo ihn liefert
+                clean_name = re.sub(r"^\d+[\s.)-]*", "", line).strip()
                 if clean_name and "Grid" not in clean_name and len(clean_name) > 1:
                     all_drivers.append(clean_name)
     grids = max(1, math.ceil(len(all_drivers) / DRIVERS_PER_GRID))
@@ -99,14 +103,12 @@ def run_check():
         sunday_msg = None
         force_send = False
 
-        # 1. Grid Voll Check (einfach ohne Sperre)
         if driver_count > 0 and driver_count % DRIVERS_PER_GRID == 0:
             full_grids = driver_count // DRIVERS_PER_GRID
             if full_grids >= MIN_GRIDS_FOR_MESSAGE:
                 options = [opt.strip() for opt in GRID_FULL_TEXT.split(";")]
                 grid_full_msg = random.choice(options).format(driver_count=driver_count, full_grids=full_grids)
 
-        # 2. Sonntag 18 Uhr Check (Sperre bleibt wichtig!)
         if now_dt.weekday() == 6 and now_dt.hour == 18 and now_dt.minute < 10:
             if state.get("last_sunday_msg_event") != event_id:
                 options = [opt.strip() for opt in SUNDAY_MSG_TEXT.split(";")]
@@ -118,7 +120,7 @@ def run_check():
         if is_new_event:
             start_log = f"📅 {ts} Event gestartet"
             if drivers:
-                initial = [f"🟢 {ts} {d} angemeldet" for d in drivers]
+                initial = [f"🟢 {ts} {clean_log_name(d)} angemeldet" for d in drivers]
                 state["log"] = start_log + "\n" + "\n".join(initial)
             else:
                 state["log"] = start_log
@@ -131,8 +133,8 @@ def run_check():
             
             if added or removed:
                 new_entries = []
-                for d in added: new_entries.append(f"🟢 {ts} {d} angemeldet")
-                for d in removed: new_entries.append(f"🔴 {ts} {d} abgemeldet")
+                for d in added: new_entries.append(f"🟢 {ts} {clean_log_name(d)} angemeldet")
+                for d in removed: new_entries.append(f"🔴 {ts} {clean_log_name(d)} abgemeldet")
                 state["log"] = (state.get("log", "") + "\n" + "\n".join(new_entries)).strip()
                 msg_type = "roster_update"
                 force_send = True
