@@ -119,8 +119,8 @@ def run_check():
                 force_send = True
 
         if is_new_event:
-            # Icon jetzt vorangestellt
-            start_log = f"📅 {ts} Event gestartet"
+            # Einheitliches Format: Tag Uhrzeit Icon Text
+            start_log = f"{ts} 📅 Apollo gestartet"
             if drivers:
                 initial = [f"{ts} 🟢 {clean_log_name(d)}" for d in drivers]
                 state["log"] = start_log + "\n" + "\n".join(initial)
