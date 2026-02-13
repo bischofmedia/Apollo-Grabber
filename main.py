@@ -6,7 +6,7 @@ import math
 import datetime
 from flask import Flask
 
-# --- KONFIGURATION (Umgebungsvariablen bei Render setzen!) ---
+# --- KONFIGURATION (Bleibt bei deinem Environment-Namen!) ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
@@ -19,14 +19,12 @@ STATE_FILE = "state.json"
 app = Flask(__name__)
 
 def get_log_timestamp():
-    """Erstellt Zeitstempel im Format: Fr 10:09"""
     days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
     now = datetime.datetime.now()
     day_str = days[now.weekday()]
     return now.strftime(f"{day_str} %H:%M")
 
 def grid_locked():
-    """Prüft die Sperre: Sonntag 18:00 bis Dienstag 10:00"""
     now = datetime.datetime.now()
     wd = now.weekday()
     if (wd == 6 and now.hour >= 18) or (wd == 0) or (wd == 1 and now.hour < 10):
@@ -38,11 +36,9 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                # Sicherstellen, dass alle Keys existieren
                 if "log" not in data: data["log"] = ""
                 return data
-        except:
-            pass
+        except: pass
     return {"event_id": None, "hash": None, "drivers": [], "grids": 1, "log": ""}
 
 def save_state(state):
@@ -53,116 +49,70 @@ def extract_data_from_embed(embed):
     fields = embed.get("fields", [])
     all_drivers = []
     full_text_for_hash = ""
-    
     for field in fields:
-        name = field.get("name", "")
-        value = field.get("value", "")
+        name, value = field.get("name", ""), field.get("value", "")
         full_text_for_hash += f"{name}{value}"
-        
-        if any(keyword in name for keyword in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
+        if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
-                # Bereinigung: Sonderzeichen (_ * < > @ !) und Nummerierung entfernen
                 clean_name = re.sub(r"[*_<>@!]", "", line)
                 clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name).strip()
-                
                 if clean_name and "Grid" not in clean_name and len(clean_name) > 1:
                     all_drivers.append(clean_name)
+    grids = max(1, math.ceil(len(all_drivers) / DRIVERS_PER_GRID))
+    return all_drivers, min(grids, MAX_GRIDS), full_text_for_hash
 
-    driver_count = len(all_drivers)
-    grids_needed = max(1, math.ceil(driver_count / DRIVERS_PER_GRID))
-    if grids_needed > MAX_GRIDS:
-        grids_needed = MAX_GRIDS
-        
-    return all_drivers, grids_needed, full_text_for_hash
-    
 def run_check():
     if not all([DISCORD_TOKEN, CHANNEL_ID, MAKE_WEBHOOK_URL]):
         return "Error: Missing Environment Variables"
-
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
     url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?limit=10"
     
     try:
         response = requests.get(url, headers=headers)
         messages = response.json()
+        apollo_msg = next((m for m in messages if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
         
-        apollo_msg = None
-        for msg in messages:
-            if msg.get("author", {}).get("id") == APOLLO_BOT_ID and msg.get("embeds"):
-                apollo_msg = msg
-                break
-        
-        if not apollo_msg:
-            return "No Apollo message found"
+        if not apollo_msg: return "No Apollo message found"
 
-        event_id = apollo_msg["id"]
-        embed = apollo_msg["embeds"][0]
+        event_id, embed = apollo_msg["id"], apollo_msg["embeds"][0]
         drivers, grids, raw_content = extract_data_from_embed(embed)
         current_hash = str(hash(raw_content))
-        
         state = load_state()
         is_new_event = (state.get("event_id") != event_id)
         
-        msg_type = ""
-        
         if is_new_event:
-            # Neues Event -> Log komplett neu starten
-            state["log"] = f"{get_log_timestamp()} ### Event gestartet"
+            ts = get_log_timestamp()
+            start_log = f"📅 {ts} Event gestartet"
+            if drivers:
+                initial = [f"🟢 {ts} {d} angemeldet" for d in drivers]
+                state["log"] = start_log + "\n" + "\n".join(initial)
+            else:
+                state["log"] = start_log
             msg_type = "event_reset" if not drivers else "event_reset_with_roster"
         else:
-            # Gleiches Event -> Auf Änderungen prüfen
             old_drivers = state.get("drivers", [])
             added = [d for d in drivers if d not in old_drivers]
             removed = [d for d in old_drivers if d not in drivers]
-            
             if added or removed:
-                current_log = state.get("log", "")
                 new_entries = []
-                for d in added: new_entries.append(f"{get_log_timestamp()} +++ {d} angemeldet")
-                for d in removed: new_entries.append(f"{get_log_timestamp()} --- {d} abgemeldet")
-                
-                # Neue Zeilen an den bestehenden Log hängen
-                if current_log:
-                    state["log"] = current_log + "\n" + "\n".join(new_entries)
-                else:
-                    state["log"] = "\n".join(new_entries)
+                for d in added: new_entries.append(f"🟢 {get_log_timestamp()} {d} angemeldet")
+                for d in removed: new_entries.append(f"🔴 {get_log_timestamp()} {d} abgemeldet")
+                state["log"] = (state.get("log", "") + "\n" + "\n".join(new_entries)).strip()
                 msg_type = "roster_update"
             elif state.get("hash") != current_hash:
                 msg_type = "roster_update"
-            else:
-                return "No change detected"
+            else: return "No change detected"
 
-        # State aktualisieren
-        state.update({
-            "event_id": event_id,
-            "hash": current_hash,
-            "drivers": drivers,
-            "grids": grids
-        })
+        state.update({"event_id": event_id, "hash": current_hash, "drivers": drivers, "grids": grids})
         save_state(state)
-
-        # Webhook an Make senden
-        payload = {
-            "type": msg_type,
-            "event_id": event_id,
-            "drivers": drivers,
-            "grids": grids,
-            "grid_locked": grid_locked(),
-            "log": state["log"],
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        
+        payload = {"type": msg_type, "drivers": drivers, "grids": grids, "grid_locked": grid_locked(), "log": state["log"], "timestamp": datetime.datetime.now().isoformat()}
         requests.post(MAKE_WEBHOOK_URL, json=payload)
         return f"Success: {msg_type} sent"
-
-    except Exception as e:
-        return f"Error: {str(e)}"
+    except Exception as e: return f"Error: {str(e)}"
 
 @app.route('/')
-def home():
-    return run_check()
+def home(): return run_check()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
