@@ -5,12 +5,18 @@ import re
 import math
 import datetime
 import pytz
+import random
 from flask import Flask
 
 # --- KONFIGURATION ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
+
+# Texte und Schwellenwerte aus Umgebungsvariablen
+GRID_FULL_TEXT = os.environ.get("GRID_FULL_TEXT", "Schon {driver_count} Anmeldungen, {full_grids} Grids sind voll!")
+SUNDAY_MSG_TEXT = os.environ.get("SUNDAY_MSG_TEXT", "Sonntag 18 Uhr: {driver_count} Fahrer, {grids} Grids. {free_slots} Plätze frei.")
+MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("MIN_GRIDS_FOR_MESSAGE", 1))
 
 APOLLO_BOT_ID = "475744554910351370"
 DRIVERS_PER_GRID = 15
@@ -21,14 +27,12 @@ BERLIN_TZ = pytz.timezone("Europe/Berlin")
 app = Flask(__name__)
 
 def get_now():
-    """Hilfsfunktion für aktuelle Zeit in Berlin."""
     return datetime.datetime.now(BERLIN_TZ)
 
 def get_log_timestamp():
     days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
     now = get_now()
-    day_str = days[now.weekday()]
-    return now.strftime(f"{day_str} %H:%M")
+    return f"{days[now.weekday()]} {now.strftime('%H:%M')}"
 
 def grid_locked():
     now = get_now()
@@ -89,17 +93,30 @@ def run_check():
         
         now_dt = get_now()
         ts = get_log_timestamp()
+        driver_count = len(drivers)
         grid_full_msg = None
         sunday_msg = None
 
-        # Logik für Meldungen
-        driver_count = len(drivers)
-        if driver_count > 0 and driver_count % 15 == 0:
-            grid_full_msg = f"Schon {driver_count} Anmeldungen, {driver_count // 15} Grids sind voll!"
+        # 1. Grid Voll Check mit Schwellenwert
+        if driver_count > 0 and driver_count % DRIVERS_PER_GRID == 0:
+            full_grids = driver_count // DRIVERS_PER_GRID
+            # Nur senden, wenn die Mindestanzahl an Grids erreicht ist
+            if full_grids >= MIN_GRIDS_FOR_MESSAGE:
+                options = [opt.strip() for opt in GRID_FULL_TEXT.split(";")]
+                grid_full_msg = random.choice(options).format(
+                    driver_count=driver_count, 
+                    full_grids=full_grids
+                )
 
+        # 2. Sonntag 18 Uhr Check
         if now_dt.weekday() == 6 and now_dt.hour == 18 and now_dt.minute < 10:
-            free = (MAX_GRIDS * DRIVERS_PER_GRID) - driver_count
-            sunday_msg = f"Es ist Sonntag 18 Uhr. Wir haben {driver_count} Anmeldungen und damit {grids} Grids. Es sind noch {max(0, free)} Plätze frei."
+            options = [opt.strip() for opt in SUNDAY_MSG_TEXT.split(";")]
+            free = max(0, (MAX_GRIDS * DRIVERS_PER_GRID) - driver_count)
+            sunday_msg = random.choice(options).format(
+                driver_count=driver_count, 
+                grids=grids, 
+                free_slots=free
+            )
 
         if is_new_event:
             start_log = f"📅 {ts} Event gestartet"
