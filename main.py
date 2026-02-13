@@ -119,9 +119,9 @@ def run_check():
                 force_send = True
 
         if is_new_event:
+            # Icon jetzt vorangestellt
             start_log = f"📅 {ts} Event gestartet"
             if drivers:
-                # Format: [Tag HH:MM] 🟢 [Name]
                 initial = [f"{ts} 🟢 {clean_log_name(d)}" for d in drivers]
                 state["log"] = start_log + "\n" + "\n".join(initial)
             else:
@@ -135,7 +135,6 @@ def run_check():
             
             if added or removed:
                 new_entries = []
-                # Neue Reihenfolge: Tag Uhrzeit Icon Name
                 for d in added: new_entries.append(f"{ts} 🟢 {clean_log_name(d)}")
                 for d in removed: new_entries.append(f"{ts} 🔴 {clean_log_name(d)}")
                 state["log"] = (state.get("log", "") + "\n" + "\n".join(new_entries)).strip()
