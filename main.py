@@ -42,7 +42,9 @@ def grid_locked():
 
 def clean_log_name(name):
     """Bereinigt Namen NUR für die Anzeige im Text-Log."""
-    return name.replace("\\_", "_").replace("\\*", "*").replace("*", "").replace("_", " ").strip()
+    # Entfernt Backslashes vor Sonderzeichen und macht es lesbarer
+    n = name.replace("\\_", "_").replace("\\*", "*").replace("*", "")
+    return n.strip()
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -69,8 +71,11 @@ def extract_data_from_embed(embed):
         if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
-                # KEINE BEREINIGUNG MEHR: Wir nehmen den Namen, wie Apollo ihn liefert
-                clean_name = re.sub(r"^\d+[\s.)-]*", "", line).strip()
+                # 1. Zitat-Markierungen ">>>" und ">" entfernen
+                clean_name = line.replace(">>>", "").replace(">", "")
+                # 2. Nummerierungen am Anfang entfernen (z.B. "1. Name")
+                clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name).strip()
+                
                 if clean_name and "Grid" not in clean_name and len(clean_name) > 1:
                     all_drivers.append(clean_name)
     grids = max(1, math.ceil(len(all_drivers) / DRIVERS_PER_GRID))
