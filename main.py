@@ -42,7 +42,6 @@ def grid_locked():
 
 def clean_log_name(name):
     """Bereinigt Namen NUR für die Anzeige im Text-Log."""
-    # Entfernt Backslashes vor Sonderzeichen und macht es lesbarer
     n = name.replace("\\_", "_").replace("\\*", "*").replace("*", "")
     return n.strip()
 
@@ -71,11 +70,8 @@ def extract_data_from_embed(embed):
         if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             lines = [l.strip() for l in value.split("\n") if l.strip()]
             for line in lines:
-                # 1. Zitat-Markierungen ">>>" und ">" entfernen
                 clean_name = line.replace(">>>", "").replace(">", "")
-                # 2. Nummerierungen am Anfang entfernen (z.B. "1. Name")
                 clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name).strip()
-                
                 if clean_name and "Grid" not in clean_name and len(clean_name) > 1:
                     all_drivers.append(clean_name)
     grids = max(1, math.ceil(len(all_drivers) / DRIVERS_PER_GRID))
@@ -125,7 +121,8 @@ def run_check():
         if is_new_event:
             start_log = f"📅 {ts} Event gestartet"
             if drivers:
-                initial = [f"🟢 {ts} {clean_log_name(d)} angemeldet" for d in drivers]
+                # Format: [Tag HH:MM] 🟢 [Name]
+                initial = [f"{ts} 🟢 {clean_log_name(d)}" for d in drivers]
                 state["log"] = start_log + "\n" + "\n".join(initial)
             else:
                 state["log"] = start_log
@@ -138,8 +135,9 @@ def run_check():
             
             if added or removed:
                 new_entries = []
-                for d in added: new_entries.append(f"🟢 {ts} {clean_log_name(d)} angemeldet")
-                for d in removed: new_entries.append(f"🔴 {ts} {clean_log_name(d)} abgemeldet")
+                # Neue Reihenfolge: Tag Uhrzeit Icon Name
+                for d in added: new_entries.append(f"{ts} 🟢 {clean_log_name(d)}")
+                for d in removed: new_entries.append(f"{ts} 🔴 {clean_log_name(d)}")
                 state["log"] = (state.get("log", "") + "\n" + "\n".join(new_entries)).strip()
                 msg_type = "roster_update"
                 force_send = True
