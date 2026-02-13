@@ -13,7 +13,6 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
 
-# Texte und Schwellenwerte aus Umgebungsvariablen
 GRID_FULL_TEXT = os.environ.get("GRID_FULL_TEXT", "Schon {driver_count} Anmeldungen, {full_grids} Grids sind voll!")
 SUNDAY_MSG_TEXT = os.environ.get("SUNDAY_MSG_TEXT", "Sonntag 18 Uhr: {driver_count} Fahrer, {grids} Grids. {free_slots} Plätze frei.")
 MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("MIN_GRIDS_FOR_MESSAGE", 1))
@@ -47,9 +46,10 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
                 if "log" not in data: data["log"] = ""
+                if "last_sunday_msg_event" not in data: data["last_sunday_msg_event"] = None
                 return data
         except: pass
-    return {"event_id": None, "hash": None, "drivers": [], "grids": 1, "log": ""}
+    return {"event_id": None, "hash": None, "drivers": [], "grids": 1, "log": "", "last_sunday_msg_event": None}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
@@ -89,34 +89,31 @@ def run_check():
         drivers, grids, raw_content = extract_data_from_embed(embed)
         current_hash = str(hash(raw_content))
         state = load_state()
-        is_new_event = (state.get("event_id") != event_id)
         
+        is_new_event = (state.get("event_id") != event_id)
         now_dt = get_now()
         ts = get_log_timestamp()
         driver_count = len(drivers)
+        
         grid_full_msg = None
         sunday_msg = None
+        force_send = False
 
-        # 1. Grid Voll Check mit Schwellenwert
+        # 1. Grid Voll Check (einfach ohne Sperre)
         if driver_count > 0 and driver_count % DRIVERS_PER_GRID == 0:
             full_grids = driver_count // DRIVERS_PER_GRID
-            # Nur senden, wenn die Mindestanzahl an Grids erreicht ist
             if full_grids >= MIN_GRIDS_FOR_MESSAGE:
                 options = [opt.strip() for opt in GRID_FULL_TEXT.split(";")]
-                grid_full_msg = random.choice(options).format(
-                    driver_count=driver_count, 
-                    full_grids=full_grids
-                )
+                grid_full_msg = random.choice(options).format(driver_count=driver_count, full_grids=full_grids)
 
-        # 2. Sonntag 18 Uhr Check
+        # 2. Sonntag 18 Uhr Check (Sperre bleibt wichtig!)
         if now_dt.weekday() == 6 and now_dt.hour == 18 and now_dt.minute < 10:
-            options = [opt.strip() for opt in SUNDAY_MSG_TEXT.split(";")]
-            free = max(0, (MAX_GRIDS * DRIVERS_PER_GRID) - driver_count)
-            sunday_msg = random.choice(options).format(
-                driver_count=driver_count, 
-                grids=grids, 
-                free_slots=free
-            )
+            if state.get("last_sunday_msg_event") != event_id:
+                options = [opt.strip() for opt in SUNDAY_MSG_TEXT.split(";")]
+                free = max(0, (MAX_GRIDS * DRIVERS_PER_GRID) - driver_count)
+                sunday_msg = random.choice(options).format(driver_count=driver_count, grids=grids, free_slots=free)
+                state["last_sunday_msg_event"] = event_id
+                force_send = True
 
         if is_new_event:
             start_log = f"📅 {ts} Event gestartet"
@@ -126,19 +123,26 @@ def run_check():
             else:
                 state["log"] = start_log
             msg_type = "event_reset"
+            force_send = True
         else:
             old_drivers = state.get("drivers", [])
             added = [d for d in drivers if d not in old_drivers]
             removed = [d for d in old_drivers if d not in drivers]
+            
             if added or removed:
                 new_entries = []
                 for d in added: new_entries.append(f"🟢 {ts} {d} angemeldet")
                 for d in removed: new_entries.append(f"🔴 {ts} {d} abgemeldet")
                 state["log"] = (state.get("log", "") + "\n" + "\n".join(new_entries)).strip()
                 msg_type = "roster_update"
+                force_send = True
             elif state.get("hash") != current_hash:
                 msg_type = "roster_update"
-            else: return "No change detected"
+                force_send = True
+            elif not force_send:
+                return "No change detected"
+            else:
+                msg_type = "status_trigger"
 
         state.update({"event_id": event_id, "hash": current_hash, "drivers": drivers, "grids": grids})
         save_state(state)
