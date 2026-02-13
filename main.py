@@ -4,9 +4,10 @@ import json
 import re
 import math
 import datetime
+import pytz
 from flask import Flask
 
-# --- KONFIGURATION (Bleibt bei deinem Environment-Namen!) ---
+# --- KONFIGURATION ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
@@ -15,17 +16,22 @@ APOLLO_BOT_ID = "475744554910351370"
 DRIVERS_PER_GRID = 15
 MAX_GRIDS = 4
 STATE_FILE = "state.json"
+BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
 app = Flask(__name__)
 
+def get_now():
+    """Hilfsfunktion für aktuelle Zeit in Berlin."""
+    return datetime.datetime.now(BERLIN_TZ)
+
 def get_log_timestamp():
     days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
-    now = datetime.datetime.now()
+    now = get_now()
     day_str = days[now.weekday()]
     return now.strftime(f"{day_str} %H:%M")
 
 def grid_locked():
-    now = datetime.datetime.now()
+    now = get_now()
     wd = now.weekday()
     if (wd == 6 and now.hour >= 18) or (wd == 0) or (wd == 1 and now.hour < 10):
         return True
@@ -81,23 +87,36 @@ def run_check():
         state = load_state()
         is_new_event = (state.get("event_id") != event_id)
         
+        now_dt = get_now()
+        ts = get_log_timestamp()
+        grid_full_msg = None
+        sunday_msg = None
+
+        # Logik für Meldungen
+        driver_count = len(drivers)
+        if driver_count > 0 and driver_count % 15 == 0:
+            grid_full_msg = f"Schon {driver_count} Anmeldungen, {driver_count // 15} Grids sind voll!"
+
+        if now_dt.weekday() == 6 and now_dt.hour == 18 and now_dt.minute < 10:
+            free = (MAX_GRIDS * DRIVERS_PER_GRID) - driver_count
+            sunday_msg = f"Es ist Sonntag 18 Uhr. Wir haben {driver_count} Anmeldungen und damit {grids} Grids. Es sind noch {max(0, free)} Plätze frei."
+
         if is_new_event:
-            ts = get_log_timestamp()
             start_log = f"📅 {ts} Event gestartet"
             if drivers:
                 initial = [f"🟢 {ts} {d} angemeldet" for d in drivers]
                 state["log"] = start_log + "\n" + "\n".join(initial)
             else:
                 state["log"] = start_log
-            msg_type = "event_reset" if not drivers else "event_reset_with_roster"
+            msg_type = "event_reset"
         else:
             old_drivers = state.get("drivers", [])
             added = [d for d in drivers if d not in old_drivers]
             removed = [d for d in old_drivers if d not in drivers]
             if added or removed:
                 new_entries = []
-                for d in added: new_entries.append(f"🟢 {get_log_timestamp()} {d} angemeldet")
-                for d in removed: new_entries.append(f"🔴 {get_log_timestamp()} {d} abgemeldet")
+                for d in added: new_entries.append(f"🟢 {ts} {d} angemeldet")
+                for d in removed: new_entries.append(f"🔴 {ts} {d} abgemeldet")
                 state["log"] = (state.get("log", "") + "\n" + "\n".join(new_entries)).strip()
                 msg_type = "roster_update"
             elif state.get("hash") != current_hash:
@@ -106,7 +125,13 @@ def run_check():
 
         state.update({"event_id": event_id, "hash": current_hash, "drivers": drivers, "grids": grids})
         save_state(state)
-        payload = {"type": msg_type, "drivers": drivers, "grids": grids, "grid_locked": grid_locked(), "log": state["log"], "timestamp": datetime.datetime.now().isoformat()}
+        
+        payload = {
+            "type": msg_type, "drivers": drivers, "grids": grids, 
+            "grid_locked": grid_locked(), "log": state["log"], 
+            "grid_full_msg": grid_full_msg, "sunday_msg": sunday_msg,
+            "timestamp": now_dt.isoformat()
+        }
         requests.post(MAKE_WEBHOOK_URL, json=payload)
         return f"Success: {msg_type} sent"
     except Exception as e: return f"Error: {str(e)}"
