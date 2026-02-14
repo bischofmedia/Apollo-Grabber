@@ -14,7 +14,7 @@ EXTRA_GRID_THRESHOLD = int(os.environ.get("SET_EXTRA_GRID_THRESHOLD", 10))
 MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("SET_MIN_GRIDS_MSG", 1))
 MANUAL_LOG_ID = os.environ.get("SET_MANUAL_LOG_ID", "").strip()
 
-# FIXES LIMIT (Darf nicht überschritten werden)
+# FIXES LIMIT
 MAX_GRIDS = 4 
 
 APOLLO_BOT_ID = "475744554910351370"
@@ -111,35 +111,37 @@ def run_check():
                 msg_type = "event_reset"
                 force_send = True
             elif is_first_start:
-                existing = [f"{ts} ⚪ {clean_name(d)} (Bestand)" for d in drivers]
-                state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 🔄 Systemstart\n" + "\n".join(existing), "log_msg_id": None, "drivers": drivers})
+                # Bestehende Fahrer mit grünem Kreis markieren, ohne (Bestand)
+                existing = [f"{ts} 🟢 {clean_name(d)}" for d in drivers]
+                state.update({
+                    "event_id": event_id, 
+                    "sent_grids": [], 
+                    "extra_grid_active": False, 
+                    "log": f"{ts} 🔄 Systemstart\n" + "\n".join(existing), 
+                    "log_msg_id": None, 
+                    "drivers": drivers
+                })
                 msg_type = "initial_load"
                 force_send = True
 
         driver_count = len(drivers)
-        # Aktuelles Kapazitätslimit (Extra Grid öffnet bei Bedarf bis MAX_GRIDS)
         grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
         
-        # Grid-Berechnung mit hartem Limit
         if is_locked:
             effective_drivers = min(driver_count, grid_cap)
             grid_count = min(MAX_GRIDS, math.ceil(effective_drivers / 15)) if effective_drivers > 0 else 0
         else:
             grid_count = min(MAX_GRIDS, math.ceil(driver_count / 15)) if driver_count > 0 else 0
 
-        # Warteliste basiert immer auf dem harten MAX_GRIDS Limit
         wait_count = max(0, driver_count - grid_cap)
         grid_full_msg = sunday_msg = waitlist_msg = moved_up_msg = extra_grid_msg = None
 
-        # 1. Extra Grid Check (Nur falls ihr temporär unter MAX_GRIDS plantet, sonst hier wirkungslos)
         if not state["extra_grid_active"] and (wd in [6,0,1]) and wait_count >= EXTRA_GRID_THRESHOLD:
-            # Hinweis: Wenn MAX_GRIDS fix ist, dient das hier nur noch der News-Meldung
             state["extra_grid_active"] = True
             extra_grid_msg = pick_text("MSG_EXTRA_GRID_TEXT", "Zusatzgrid eröffnet!").format(waitlist_count=wait_count)
             discord_post(CHAN_NEWS, extra_grid_msg)
             force_send = True
 
-        # 2. Grid Voll Check (Nur bis zum harten Limit melden)
         if driver_count > 0 and driver_count % 15 == 0:
             full = driver_count // 15
             if full <= MAX_GRIDS and full >= MIN_GRIDS_FOR_MESSAGE and full not in state["sent_grids"]:
@@ -148,7 +150,6 @@ def run_check():
                 state["sent_grids"].append(full)
                 force_send = True
 
-        # 3. Sonntag 18 Uhr Check
         if wd == 6 and get_now().hour == 18 and get_now().minute < 10:
             if state.get("last_sunday_msg_event") != event_id:
                 free = max(0, grid_cap - driver_count)
