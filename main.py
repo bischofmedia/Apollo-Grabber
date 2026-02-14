@@ -18,6 +18,8 @@ GRID_FULL_TEXT = os.environ.get("GRID_FULL_TEXT", "Grid {full_grids} ist voll!")
 SUNDAY_MSG_TEXT = os.environ.get("SUNDAY_MSG_TEXT", "Sonntag 18 Uhr: {driver_count} Fahrer.")
 WAITLIST_TEXT_SINGLE = os.environ.get("WAITLIST_TEXT_SINGLE", "Warteliste: {driver_names} ist neu dabei.")
 WAITLIST_TEXT_MULTI = os.environ.get("WAITLIST_TEXT_MULTI", "Warteliste: {driver_names} sind neu dabei.")
+MOVED_UP_TEXT_SINGLE = os.environ.get("MOVED_UP_TEXT_SINGLE", "{driver_names} ist nachgerückt!")
+MOVED_UP_TEXT_MULTI = os.environ.get("MOVED_UP_TEXT_MULTI", "{driver_names} sind nachgerückt!")
 EXTRA_GRID_TEXT = os.environ.get("EXTRA_GRID_TEXT", "Zusatzgrid eröffnet!")
 EXTRA_GRID_THRESHOLD = int(os.environ.get("EXTRA_GRID_THRESHOLD", 10))
 MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("MIN_GRIDS_FOR_MESSAGE", 1))
@@ -40,6 +42,11 @@ def grid_locked():
     now = get_now()
     wd = now.weekday()
     return (wd == 6 and now.hour >= 18) or (wd == 0) or (wd == 1 and now.hour < 10)
+
+def pick_text(env_value):
+    """Sucht zufällig einen Text aus einer durch Semikolon getrennten Liste aus."""
+    options = [opt.strip() for opt in env_value.split(";")]
+    return random.choice(options)
 
 def clean_log_name(name):
     return name.replace("\\_", "_").replace("\\*", "*").replace("*", "").strip()
@@ -99,7 +106,7 @@ def run_check():
         ts = get_log_timestamp()
         is_new_event = (state.get("event_id") != event_id)
         
-        grid_full_msg = sunday_msg = waitlist_msg = extra_grid_msg = None
+        grid_full_msg = sunday_msg = waitlist_msg = moved_up_msg = extra_grid_msg = None
         force_send = False
 
         if is_new_event:
@@ -111,6 +118,7 @@ def run_check():
 
         driver_count = len(drivers)
         current_max_grids = 5 if state["extra_grid_active"] else MAX_GRIDS
+        grid_capacity = current_max_grids * DRIVERS_PER_GRID
         grids = min(current_max_grids, max(1, math.ceil(driver_count / DRIVERS_PER_GRID)))
         waitlist_count = max(0, driver_count - (MAX_GRIDS * DRIVERS_PER_GRID))
 
@@ -118,25 +126,24 @@ def run_check():
         if ENABLE_EXTRA_GRID and not state["extra_grid_active"] and grid_locked():
             if waitlist_count >= EXTRA_GRID_THRESHOLD:
                 state["extra_grid_active"] = True
-                extra_grid_msg = EXTRA_GRID_TEXT.format(waitlist_count=waitlist_count)
+                extra_grid_msg = pick_text(EXTRA_GRID_TEXT).format(waitlist_count=waitlist_count)
                 grids = 5
+                grid_capacity = 75
                 force_send = True
 
         # Grid Voll Check
         if ENABLE_GRID_FULL_MSG and driver_count > 0 and driver_count % DRIVERS_PER_GRID == 0:
             full_grids_count = driver_count // DRIVERS_PER_GRID
             if full_grids_count >= MIN_GRIDS_FOR_MESSAGE and full_grids_count not in state["sent_grids"]:
-                options = [opt.strip() for opt in GRID_FULL_TEXT.split(";")]
-                grid_full_msg = random.choice(options).format(driver_count=driver_count, full_grids=full_grids_count)
+                grid_full_msg = pick_text(GRID_FULL_TEXT).format(driver_count=driver_count, full_grids=full_grids_count)
                 state["sent_grids"].append(full_grids_count)
                 force_send = True
 
         # Sonntag 18 Uhr
         if ENABLE_SUNDAY_MSG and now_dt.weekday() == 6 and now_dt.hour == 18 and now_dt.minute < 10:
             if state["last_sunday_msg_event"] != event_id:
-                options = [opt.strip() for opt in SUNDAY_MSG_TEXT.split(";")]
-                free = max(0, (current_max_grids * DRIVERS_PER_GRID) - driver_count)
-                sunday_msg = random.choice(options).format(driver_count=driver_count, grids=grids, free_slots=free)
+                free = max(0, grid_capacity - driver_count)
+                sunday_msg = pick_text(SUNDAY_MSG_TEXT).format(driver_count=driver_count, grids=grids, free_slots=free)
                 state["last_sunday_msg_event"] = event_id
                 force_send = True
 
@@ -149,13 +156,23 @@ def run_check():
             new_entries = [f"{ts} 🟢 {clean_log_name(d)}" for d in added] + [f"{ts} 🔴 {clean_log_name(d)}" for d in removed]
             state["log"] = (state["log"] + "\n" + "\n".join(new_entries)).strip()
             
-            # Wartelisten-Meldung mit Singular/Plural Check
-            if ENABLE_WAITLIST_MSG and added and grid_locked() and driver_count > (current_max_grids * DRIVERS_PER_GRID):
-                names_str = ", ".join([clean_log_name(d) for d in added])
-                if len(added) == 1:
-                    waitlist_msg = WAITLIST_TEXT_SINGLE.format(driver_names=names_str)
-                else:
-                    waitlist_msg = WAITLIST_TEXT_MULTI.format(driver_names=names_str)
+            if grid_locked():
+                new_on_waitlist = [clean_log_name(d) for d in added if drivers.index(d) >= grid_capacity]
+                if ENABLE_WAITLIST_MSG and new_on_waitlist:
+                    names_str = ", ".join(new_on_waitlist)
+                    txt = WAITLIST_TEXT_SINGLE if len(new_on_waitlist) == 1 else WAITLIST_TEXT_MULTI
+                    waitlist_msg = pick_text(txt).format(driver_names=names_str)
+
+                moved_up_drivers = []
+                if removed:
+                    for i, d in enumerate(drivers):
+                        if i < grid_capacity and d in old_drivers and old_drivers.index(d) >= grid_capacity:
+                            moved_up_drivers.append(clean_log_name(d))
+                
+                if moved_up_drivers:
+                    names_str = ", ".join(moved_up_drivers)
+                    txt = MOVED_UP_TEXT_SINGLE if len(moved_up_drivers) == 1 else MOVED_UP_TEXT_MULTI
+                    moved_up_msg = pick_text(txt).format(driver_names=names_str)
 
         if not force_send and state.get("hash") == current_hash: return "No change"
 
@@ -165,7 +182,8 @@ def run_check():
         payload = {
             "type": msg_type, "drivers": drivers, "grids": grids, "grid_locked": grid_locked(),
             "log": state["log"], "grid_full_msg": grid_full_msg, "sunday_msg": sunday_msg,
-            "waitlist_msg": waitlist_msg, "extra_grid_msg": extra_grid_msg, "timestamp": now_dt.isoformat()
+            "waitlist_msg": waitlist_msg, "moved_up_msg": moved_up_msg, "extra_grid_msg": extra_grid_msg, 
+            "timestamp": now_dt.isoformat()
         }
         requests.post(MAKE_WEBHOOK_URL, json=payload)
         return f"Success: {msg_type} sent"
