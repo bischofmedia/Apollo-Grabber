@@ -91,7 +91,7 @@ def run_check():
         res = requests.get(f"https://discord.com/api/v10/channels/{CHAN_APOLLO}/messages?limit=10", headers=headers)
         messages = res.json()
         apollo_msg = next((m for m in messages if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "No Apollo message found"
+        if not apollo_msg: return "Keine Apollo-Nachricht gefunden."
 
         event_id = apollo_msg["id"]
         drivers, raw_content = extract_data(apollo_msg["embeds"][0])
@@ -102,104 +102,87 @@ def run_check():
         is_new = (state.get("event_id") and state["event_id"] != event_id)
         is_first_start = (state.get("event_id") is None)
         msg_type = "status_trigger"
+        force_send = False
 
-        # Initialisierung / Wochenwechsel
         if is_new or is_first_start:
             if is_new:
                 if not MANUAL_LOG_ID: discord_delete(CHAN_LOG, state.get("log_msg_id"))
                 if DELETE_OLD_EVENT: discord_delete(CHAN_APOLLO, state["event_id"])
                 state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 📅 Start", "log_msg_id": None, "drivers": []})
                 msg_type = "event_reset"
+                force_send = True
             elif is_first_start:
-                # Bestehende Fahrer beim allerersten Start ins Log aufnehmen
-                existing_log_entries = [f"{ts} ⚪ {clean_name(d)} (Bereits angemeldet)" for d in drivers]
-                state.update({
-                    "event_id": event_id, 
-                    "sent_grids": [], 
-                    "extra_grid_active": False, 
-                    "log": f"{ts} 🔄 Systemstart\n" + "\n".join(existing_log_entries),
-                    "log_msg_id": None, 
-                    "drivers": drivers
-                })
+                existing_entries = [f"{ts} ⚪ {clean_name(d)} (Bestand)" for d in drivers]
+                state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 🔄 Systemstart\n" + "\n".join(existing_entries), "log_msg_id": None, "drivers": drivers})
                 msg_type = "initial_load"
+                force_send = True
 
         driver_count = len(drivers)
         grid_cap = 75 if state["extra_grid_active"] else 60
         wait_count = max(0, driver_count - 60)
         grid_full_msg = sunday_msg = waitlist_msg = moved_up_msg = extra_grid_msg = None
 
-        # 1. Extra Grid Check
         if not state["extra_grid_active"] and (get_now().weekday() in [6,0,1]) and wait_count >= EXTRA_GRID_THRESHOLD:
             state["extra_grid_active"] = True
             extra_grid_msg = pick_text(EXTRA_GRID_TEXT).format(waitlist_count=wait_count)
             discord_post(CHAN_NEWS, extra_grid_msg)
             grid_cap = 75
+            force_send = True
 
-        # 2. Grid Voll Check
         if driver_count > 0 and driver_count % 15 == 0:
             full = driver_count // 15
             if full >= MIN_GRIDS_FOR_MESSAGE and full not in state["sent_grids"]:
                 grid_full_msg = pick_text(GRID_FULL_TEXT).format(full_grids=full)
                 discord_post(CHAN_NEWS, grid_full_msg)
                 state["sent_grids"].append(full)
+                force_send = True
 
-        # 3. Sonntag 18 Uhr Check
         if get_now().weekday() == 6 and get_now().hour == 18 and get_now().minute < 10:
             if state.get("last_sunday_msg_event") != event_id:
                 free = max(0, grid_cap - driver_count)
                 sunday_msg = pick_text(SUNDAY_MSG_TEXT).format(driver_count=driver_count, free_slots=free)
                 discord_post(CHAN_LOG, sunday_msg)
                 state["last_sunday_msg_event"] = event_id
+                force_send = True
 
-        # 4. Roster Update (Vergleich alt vs. neu)
         old = state.get("drivers", [])
         added = [d for d in drivers if d not in old]
         removed = [d for d in old if d not in drivers]
         
         if added or removed:
-            new_log_entries = [f"{ts} 🟢 {clean_name(d)}" for d in added] + [f"{ts} 🔴 {clean_name(d)}" for d in removed]
-            state["log"] += "\n" + "\n".join(new_log_entries)
-            
+            state["log"] += "\n" + "\n".join([f"{ts} 🟢 {clean_name(d)}" for d in added] + [f"{ts} 🔴 {clean_name(d)}" for d in removed])
             wd = get_now().weekday()
             grid_locked = (wd == 6 and get_now().hour >= 18) or (wd == 0) or (wd == 1 and get_now().hour < 10)
             if grid_locked:
                 wait_list = [clean_name(d) for d in added if drivers.index(d) >= grid_cap]
                 if wait_list:
-                    txt = WAITLIST_SINGLE if len(wait_list) == 1 else WAITLIST_MULTI
-                    waitlist_msg = pick_text(txt).format(driver_names=", ".join(wait_list))
+                    waitlist_msg = pick_text(WAITLIST_SINGLE if len(wait_list) == 1 else WAITLIST_MULTI).format(driver_names=", ".join(wait_list))
                     discord_post(CHAN_NEWS, waitlist_msg)
-                
                 up = [clean_name(d) for i, d in enumerate(drivers) if i < grid_cap and d in old and old.index(d) >= grid_cap]
                 if up:
-                    txt = MOVED_UP_SINGLE if len(up) == 1 else MOVED_UP_MULTI
-                    moved_up_msg = pick_text(txt).format(driver_names=", ".join(up))
+                    moved_up_msg = pick_text(MOVED_UP_SINGLE if len(up) == 1 else MOVED_UP_MULTI).format(driver_names=", ".join(up))
                     discord_post(CHAN_NEWS, moved_up_msg)
             msg_type = "roster_update"
 
-        # Update ausführen wenn sich der Inhalt geändert hat
-        if state.get("hash") != current_hash or msg_type == "initial_load":
+        if state.get("hash") != current_hash or force_send:
             state["log_msg_id"] = send_or_edit_log(state["log"], state.get("log_msg_id"))
             state["hash"] = current_hash
             state["drivers"] = drivers
             save_state(state)
             
             if MAKE_WEBHOOK_URL:
-                payload = {
-                    "type": msg_type,
-                    "drivers_count": driver_count,
-                    "drivers_list": drivers,
-                    "log": state["log"],
-                    "grid_full_msg": grid_full_msg,
-                    "sunday_msg": sunday_msg,
-                    "waitlist_msg": waitlist_msg,
-                    "moved_up_msg": moved_up_msg,
-                    "extra_grid_msg": extra_grid_msg,
-                    "timestamp": get_now().isoformat()
-                }
+                payload = {"type": msg_type, "drivers_count": driver_count, "drivers_list": drivers, "log": state["log"], "grid_full_msg": grid_full_msg, "sunday_msg": sunday_msg, "waitlist_msg": waitlist_msg, "moved_up_msg": moved_up_msg, "extra_grid_msg": extra_grid_msg, "timestamp": get_now().isoformat()}
                 requests.post(MAKE_WEBHOOK_URL, json=payload)
+            
+            # Ausführliche Rückmeldung für den Browser
+            res_txt = f"Aktion: {msg_type} (Fahrer: {driver_count})<br>"
+            if added: res_txt += f"🟢 Neu: {', '.join([clean_name(d) for d in added])}<br>"
+            if removed: res_txt += f"🔴 Weg: {', '.join([clean_name(d) for d in removed])}<br>"
+            if grid_full_msg: res_txt += "📢 Nachricht: Grid Voll gesendet<br>"
+            return res_txt
         
-        return "OK"
-    except Exception as e: return str(e)
+        return f"Keine Änderungen am Roster. Fahrer aktuell: {driver_count}"
+    except Exception as e: return f"Fehler: {str(e)}"
 
 @app.route('/')
 def home(): return run_check()
