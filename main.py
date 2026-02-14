@@ -90,12 +90,10 @@ def home():
             webhook_type = "event_reset"
             state.update({"event_id": apollo_msg["id"], "sent_grids": [], "log_v2": [], "drivers": drivers, "grid_override": None, "extra_grid_active": False})
             state["log_v2"].append(f"{now_iso}|✨ Neues Event erkannt")
-            # Initiales Roster ins Log schreiben
             for idx, d in enumerate(drivers):
                 icon = "🟢" if idx < grid_cap else "🟡"
-                suffix = "" if idx < grid_cap else " (Waitlist)"
-                state["log_v2"].append(f"{now_iso}|{icon} {clean_name(d)}{suffix}")
-            report.append("✨ <b>Event Reset:</b> Roster initialisiert.")
+                state["log_v2"].append(f"{now_iso}|{icon} {clean_name(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
+            report.append("✨ <b>Event Reset:</b> Log und Roster neu initialisiert.")
             added, removed = [], []
         else:
             old = state.get("drivers", [])
@@ -117,6 +115,14 @@ def home():
         driver_count = len(drivers)
         grid_count = state["grid_override"] if state.get("grid_override") else min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
 
+        # Vollständiges Log für Make (ohne Zeitfilter)
+        full_log_text = ""
+        for entry in state.get("log_v2", []):
+            if "|" in entry:
+                ts_str, content = entry.split("|", 1)
+                ts_dt = datetime.datetime.fromisoformat(ts_str)
+                full_log_text += f"{format_ts_short(ts_dt.astimezone(BERLIN_TZ))} {content.strip()}\n"
+
         # Webhook Sync
         webhook_status = "Keine Änderung"
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
@@ -126,6 +132,7 @@ def home():
                     "driver_count": driver_count,
                     "drivers": [clean_name(d) for d in drivers],
                     "grids": grid_count,
+                    "log_history": full_log_text.strip(), # Das komplette Log für das Sheet
                     "timestamp": now_iso
                 }
                 requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
@@ -138,7 +145,7 @@ def home():
         state["drivers"] = drivers
         save_state(state)
         
-        return f"<h2>Apollo-Monitor</h2>Status: {'LOCK' if is_locked else 'OPEN'}<br>Sync: {webhook_status}<br><br>Letzte Aktivitäten:<br>" + ("<br>".join(report) if report else "Warte auf Änderungen...")
+        return f"<h2>Apollo-Monitor</h2>Status: {'LOCK' if is_locked else 'OPEN'}<br>Sync: {webhook_status}<br><br>Letzte Änderungen:<br>" + ("<br>".join(report) if report else "Warte...")
 
     except Exception as e: return f"Error: {str(e)}", 500
 
@@ -151,18 +158,19 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
     
     log_entries = []
     now = get_now()
+    # Für Discord begrenzen wir die Anzeige auf die letzten 25 Einträge (wegen Zeichenlimit), 
+    # aber ohne den 24h-Zeitfilter zu erzwingen.
     for entry in state.get("log_v2", []):
         ts_str, content = entry.split("|", 1)
         ts_dt = datetime.datetime.fromisoformat(ts_str)
-        if now - ts_dt <= datetime.timedelta(hours=24):
-            log_entries.append(f"{format_ts_short(ts_dt.astimezone(BERLIN_TZ))} {content.strip()}")
+        log_entries.append(f"{format_ts_short(ts_dt.astimezone(BERLIN_TZ))} {content.strip()}")
     
-    log_text = "\n".join(log_entries[-25:]) if log_entries else "Initialisiere..."
+    display_log = "\n".join(log_entries[-25:]) if log_entries else "Initialisiere..."
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync']).astimezone(BERLIN_TZ)) if state.get('last_make_sync') else "--"
     
     formatted = (f"{icon} **{status}**\n"
                  f"Fahrer / Drivers: `{driver_count}` | Grids: `{grid_count}`\n\n"
-                 f"```\n{log_text}\n```\n"
+                 f"```\n{display_log}\n```\n"
                  f"*Stand: {format_ts_short(now)}*\n"
                  f"*Letzte Übertragung / Last Grid Sync: {sync_ts}*\n"
                  f"**Legende:** 🟢 Angemeldet/Registered | 🟡 Warteliste/Waitlist | 🔴 Abgemeldet/Withdrawn")
