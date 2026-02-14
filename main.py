@@ -88,17 +88,14 @@ def home():
 
         if is_new or state.get("event_id") is None:
             webhook_type = "event_reset"
-            # Initialisiere State neu
             state.update({"event_id": apollo_msg["id"], "sent_grids": [], "log_v2": [], "drivers": drivers, "grid_override": None, "extra_grid_active": False})
-            
-            # WICHTIG: Alle bereits angemeldeten Fahrer sofort ins Log schreiben
             state["log_v2"].append(f"{now_iso}|✨ Neues Event erkannt")
+            # Initiales Roster ins Log schreiben
             for idx, d in enumerate(drivers):
                 icon = "🟢" if idx < grid_cap else "🟡"
                 suffix = "" if idx < grid_cap else " (Waitlist)"
                 state["log_v2"].append(f"{now_iso}|{icon} {clean_name(d)}{suffix}")
-            
-            report.append("✨ <b>Event Reset:</b> Neues Event mit Roster initialisiert.")
+            report.append("✨ <b>Event Reset:</b> Roster initialisiert.")
             added, removed = [], []
         else:
             old = state.get("drivers", [])
@@ -120,12 +117,12 @@ def home():
         driver_count = len(drivers)
         grid_count = state["grid_override"] if state.get("grid_override") else min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
 
-        # Webhook Sync an Make
+        # Webhook Sync
         webhook_status = "Keine Änderung"
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
             if not is_locked or is_new:
                 payload = {
-                    "type": webhook_type, # "event_reset" oder "update"
+                    "type": webhook_type,
                     "driver_count": driver_count,
                     "drivers": [clean_name(d) for d in drivers],
                     "grids": grid_count,
@@ -148,11 +145,12 @@ def home():
 def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
     headers = {"Authorization": f"Bot {config['DISCORD_TOKEN']}", "Content-Type": "application/json"}
     grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
+    
     icon = "🟡" if is_locked and driver_count >= grid_cap else ("🔴" if is_locked else "🟢")
+    status = "Anmeldung geöffnet / Registration open" if not is_locked else ("Grids gesperrt & voll / Grids locked & full" if driver_count >= grid_cap else "Grids gesperrt / Grids locked")
     
     log_entries = []
     now = get_now()
-    # Zeige die letzten 24h an, aber mindestens die letzten 20 Einträge
     for entry in state.get("log_v2", []):
         ts_str, content = entry.split("|", 1)
         ts_dt = datetime.datetime.fromisoformat(ts_str)
@@ -161,13 +159,13 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
     
     log_text = "\n".join(log_entries[-25:]) if log_entries else "Initialisiere..."
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync']).astimezone(BERLIN_TZ)) if state.get('last_make_sync') else "--"
-    legend = "🟢 Grid | 🟡 Warteliste/Waitlist | 🔴 Abgemeldet/Withdrawn"
-
-    formatted = (f"{icon} **Grid-Monitor**\n"
-                 f"Fahrer: `{driver_count}` | Grids: `{grid_count}`\n"
+    
+    formatted = (f"{icon} **{status}**\n"
+                 f"Fahrer / Drivers: `{driver_count}` | Grids: `{grid_count}`\n\n"
                  f"```\n{log_text}\n```\n"
-                 f"*Sync: {sync_ts}*\n"
-                 f"**Legende:** {legend}")
+                 f"*Stand: {format_ts_short(now)}*\n"
+                 f"*Letzte Übertragung / Last Grid Sync: {sync_ts}*\n"
+                 f"**Legende:** 🟢 Angemeldet/Registered | 🟡 Warteliste/Waitlist | 🔴 Abgemeldet/Withdrawn")
 
     tid = SET_MANUAL_LOG_ID or state.get("log_msg_id")
     if tid:
