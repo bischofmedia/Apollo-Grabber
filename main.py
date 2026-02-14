@@ -11,7 +11,6 @@ def get_env_config():
         "MAKE_WEBHOOK_URL": os.environ.get("MAKE_WEBHOOK_URL")
     }
 
-# Parameter-Namen aus deiner Render-Konfiguration
 DELETE_OLD_EVENT = os.environ.get("DELETE_OLD_EVENT", "0") == "1"
 EXTRA_GRID_THRESHOLD = int(os.environ.get("EXTRA_GRID_THRESHOLD", 10))
 SET_MIN_GRIDS_MSG = int(os.environ.get("SET_MIN_GRIDS_MSG", 1))
@@ -77,7 +76,6 @@ def home():
         wd = now.weekday()
         grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
         
-        # Sperr-Prüfung
         is_locked = (wd == 6 and now.hour >= 18) or (wd == 0)
         if not is_locked and wd == 0 and REG_END_TIME:
             try:
@@ -93,8 +91,7 @@ def home():
         if is_new or state.get("event_id") is None:
             webhook_type = "event_reset"
             state.update({"event_id": apollo_msg["id"], "sent_grids": [], "log_v2": [], "drivers": drivers, "grid_override": None, "extra_grid_active": False})
-            state["log_v2"].append(f"{now_iso}|✨ Neues Event erkannt")
-            report.append("✨ <b>Event Reset:</b> Neues Event erkannt.")
+            state["log_v2"].append(f"{now_iso}|✨ Neues Event")
             added, removed = [], []
         else:
             old = state.get("drivers", [])
@@ -104,7 +101,7 @@ def home():
             for d in added:
                 idx = drivers.index(d)
                 icon = "🟢" if idx < grid_cap else "🟡"
-                state["log_v2"].append(f"{now_iso}|{icon} {clean_name(d)}{'' if idx < grid_cap else ' (Warteliste)'}")
+                state["log_v2"].append(f"{now_iso}|{icon} {clean_name(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
                 report.append(f"🟢 + {clean_name(d)}")
             for d in removed:
                 state["log_v2"].append(f"{now_iso}|🔴 {clean_name(d)}")
@@ -113,30 +110,21 @@ def home():
         driver_count = len(drivers)
         grid_count = state["grid_override"] if state.get("grid_override") else min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
 
-        # Webhook Sync an Make
         webhook_status = "Keine Änderung"
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new or request.args.get('grids')):
             if not is_locked or is_new:
-                # NUR saubere Namen an das Sheet senden
-                clean_drivers = [clean_name(d) for d in drivers]
-                payload = {
-                    "type": webhook_type,
-                    "driver_count": driver_count,
-                    "drivers": clean_drivers, # Saubere Liste für das Sheet
-                    "grids": grid_count,
-                    "timestamp": now_iso
-                }
+                payload = {"type": webhook_type, "driver_count": driver_count, "drivers": [clean_name(d) for d in drivers], "grids": grid_count, "timestamp": now_iso}
                 requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
                 state["last_make_sync"] = now_iso
-                webhook_status = f"✅ Gesendet ({webhook_type})"
+                webhook_status = f"✅ {webhook_type}"
             else:
-                webhook_status = "🚫 Blockiert (Lock)"
+                webhook_status = "🚫 Lock"
 
         state["log_msg_id"] = send_or_edit_log(state, driver_count, grid_count, is_locked, config)
         state["drivers"] = drivers
         save_state(state)
         
-        return f"<h2>Apollo-Monitor</h2>Status: {'LOCK' if is_locked else 'OPEN'}<br>Sync: {webhook_status}<br><br>Aktivitäten:<br>" + ("<br>".join(report) if report else "Keine Roster-Änderung.")
+        return f"<h2>Apollo-Monitor</h2>Status: {'LOCK' if is_locked else 'OPEN'}<br>Sync: {webhook_status}"
 
     except Exception as e: return f"Error: {str(e)}", 500
 
@@ -152,10 +140,17 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
         if now - datetime.datetime.fromisoformat(ts_str) <= datetime.timedelta(hours=24):
             log_entries.append(f"{format_ts_short(datetime.datetime.fromisoformat(ts_str).astimezone(BERLIN_TZ))} {content.strip()}")
     
-    log_text = "\n".join(log_entries) if log_entries else "Keine Änderungen."
+    log_text = "\n".join(log_entries) if log_entries else "Keine Änderungen / No changes."
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync']).astimezone(BERLIN_TZ)) if state.get('last_make_sync') else "--"
     
-    formatted = f"{icon} **Grid-Monitor**\nFahrer: `{driver_count}` | Grids: `{grid_count}`\n```\n{log_text}\n```\n*Sync: {sync_ts}*"
+    # Die Legende in einer Zeile
+    legend = "🟢 Grid | 🟡 Warteliste/Waitlist | 🔴 Abgemeldet/Withdrawn"
+
+    formatted = (f"{icon} **Grid-Monitor**\n"
+                 f"Fahrer: `{driver_count}` | Grids: `{grid_count}`\n"
+                 f"```\n{log_text}\n```\n"
+                 f"*Sync: {sync_ts}*\n"
+                 f"**Legende:** {legend}")
 
     tid = SET_MANUAL_LOG_ID or state.get("log_msg_id")
     if tid:
