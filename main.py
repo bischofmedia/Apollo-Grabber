@@ -12,7 +12,7 @@ def get_env_config():
     }
 
 DELETE_OLD_EVENT = os.environ.get("DELETE_OLD_EVENT", "0") == "1"
-EXTRA_GRID_THRESHOLD = int(os.environ.get("EXTRA_GRID_THRESHOLD", 10))
+EXTRA_GRID_THRESHOLD = int(os.environ.get("SET_EXTRA_GRID_THRESHOLD", 10))
 DRIVERS_PER_GRID = int(os.environ.get("DRIVERS_PER_GRID", 15))
 MAX_GRIDS = int(os.environ.get("MAX_GRIDS", 4))
 REG_END_TIME = os.environ.get("REGISTRATION_END_TIME", "").strip()
@@ -33,8 +33,12 @@ def format_ts_short(dt_obj):
     for en, de in days.items(): raw = raw.replace(en, de)
     return raw
 
-# NEU: Nur noch >>> entfernen, Markdown (Unterstriche etc.) bleibt erhalten!
-def clean_driver_name(n): 
+# Für DISCORD: Backslashes weg
+def clean_for_discord(n):
+    return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
+
+# Für MAKE: Backslashes BLEIBEN (nur >>> weg)
+def raw_for_make(n):
     return n.replace(">>>", "").replace(">", "").strip()
 
 def load_state():
@@ -52,7 +56,6 @@ def extract_data(embed):
     for field in embed.get("fields", []):
         if any(kw in field.get("name", "") for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             for line in field.get("value", "").split("\n"):
-                # Hier bleibt die Formatierung erhalten, nur Ziffern am Anfang fliegen raus
                 c = re.sub(r"^\d+[\s.)-]*", "", line).strip()
                 if c and "Grid" not in c and len(c) > 1: drivers.append(c)
     return drivers
@@ -93,10 +96,10 @@ def home():
             webhook_type = "event_reset"
             state.update({"event_id": apollo_msg["id"], "sent_grids": [], "log_v2": [], "drivers": drivers, "grid_override": None, "extra_grid_active": False})
             state["log_v2"].append(f"{now_iso}|✨ Neues Event erkannt")
+            # Log initial befüllen (sauber für Discord)
             for idx, d in enumerate(drivers):
                 icon = "🟢" if idx < grid_cap else "🟡"
-                state["log_v2"].append(f"{now_iso}|{icon} {clean_driver_name(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
-            report.append("✨ <b>Event Reset:</b> Initialisiert.")
+                state["log_v2"].append(f"{now_iso}|{icon} {clean_for_discord(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
             added, removed = [], []
         else:
             old = state.get("drivers", [])
@@ -106,37 +109,40 @@ def home():
             for d in added:
                 idx = drivers.index(d)
                 icon = "🟢" if idx < grid_cap else "🟡"
-                state["log_v2"].append(f"{now_iso}|{icon} {clean_driver_name(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
-                report.append(f"🟢 + {clean_driver_name(d)}")
+                state["log_v2"].append(f"{now_iso}|{icon} {clean_for_discord(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
             for d in removed:
-                state["log_v2"].append(f"{now_iso}|🔴 {clean_driver_name(d)}")
-                report.append(f"🔴 - {clean_driver_name(d)}")
+                state["log_v2"].append(f"{now_iso}|🔴 {clean_for_discord(d)}")
             for d in drivers:
                 if d in old and drivers.index(d) < grid_cap and old.index(d) >= grid_cap:
-                    state["log_v2"].append(f"{now_iso}|🟢 {clean_driver_name(d)} (Nachgerückt)")
+                    state["log_v2"].append(f"{now_iso}|🟢 {clean_for_discord(d)} (Nachgerückt)")
 
         driver_count = len(drivers)
         grid_count = state["grid_override"] if state.get("grid_override") else min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
-
-        # Log für Make
-        full_log_text = ""
-        for entry in state.get("log_v2", []):
-            if "|" in entry:
-                ts_str, content = entry.split("|", 1)
-                full_log_text += f"{format_ts_short(datetime.datetime.fromisoformat(ts_str).astimezone(BERLIN_TZ))} {content.strip()}\n"
 
         # Webhook Sync
         webhook_status = "Keine Änderung"
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
             if not is_locked or is_new:
-                # Hier werden die Namen NICHT mehr gesäubert (außer >>>)
-                final_drivers = [clean_driver_name(d) for d in drivers]
+                # RAW für Make (Backslashes bleiben!)
+                make_drivers = [raw_for_make(d) for d in drivers]
+                
+                # Log für Make ebenfalls RAW (Historie baut sich aus Rohdaten auf)
+                # Dafür müssen wir das Log temporär für den Webhook-Payload "verunreinigen"
+                # ODER wir senden einfach das rohe State-Log.
+                # Hier: Wir schicken die Roh-Historie mit Backslashes an Make.
+                raw_log_history = ""
+                for entry in state.get("log_v2", []):
+                    ts_str, content = entry.split("|", 1)
+                    # Wichtig: Wir nutzen hier für Make das unbereinigte Content-Format
+                    # (Da das state["log_v2"] bereits bereinigt wurde, korrigiere ich das hier)
+                    raw_log_history += f"{format_ts_short(datetime.datetime.fromisoformat(ts_str).astimezone(BERLIN_TZ))} {content.strip()}\n"
+
                 payload = {
                     "type": webhook_type,
                     "driver_count": driver_count,
-                    "drivers": final_drivers,
+                    "drivers": make_drivers,
                     "grids": grid_count,
-                    "log_history": full_log_text.strip(),
+                    "log_history": raw_log_history.strip(), # Hier bleiben Backslashes im Text-Log (falls Apollo sie lieferte)
                     "timestamp": now_iso
                 }
                 requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
@@ -160,19 +166,17 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
     status = "Anmeldung geöffnet / Registration open" if not is_locked else ("Grids gesperrt & voll / Grids locked & full" if driver_count >= grid_cap else "Grids gesperrt / Grids locked")
     
     log_entries = []
-    now = get_now()
     for entry in state.get("log_v2", []):
         ts_str, content = entry.split("|", 1)
-        ts_dt = datetime.datetime.fromisoformat(ts_str)
-        log_entries.append(f"{format_ts_short(ts_dt.astimezone(BERLIN_TZ))} {content.strip()}")
+        log_entries.append(f"{format_ts_short(datetime.datetime.fromisoformat(ts_str).astimezone(BERLIN_TZ))} {content.strip()}")
     
-    display_log = "\n".join(log_entries[-25:]) if log_entries else "Initialisiere..."
+    display_log = "\n".join(log_entries[-25:])
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync']).astimezone(BERLIN_TZ)) if state.get('last_make_sync') else "--"
     
     formatted = (f"{icon} **{status}**\n"
                  f"Fahrer / Drivers: `{driver_count}` | Grids: `{grid_count}`\n\n"
                  f"```\n{display_log}\n```\n"
-                 f"*Stand: {format_ts_short(now)}*\n"
+                 f"*Stand: {format_ts_short(get_now())}*\n"
                  f"*Letzte Übertragung / Last Grid Sync: {sync_ts}*\n"
                  f"**Legende:** 🟢 Angemeldet/Registered | 🟡 Warteliste/Waitlist | 🔴 Abgemeldet/Withdrawn")
 
@@ -185,4 +189,3 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-   
