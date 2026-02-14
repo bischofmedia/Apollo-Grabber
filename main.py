@@ -1,5 +1,5 @@
 import os, requests, json, re, math, datetime, pytz, random
-from flask import Flask
+from flask import Flask, request
 
 # --- KONFIGURATION ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -8,21 +8,61 @@ CHAN_LOG = os.environ.get("CHAN_MAIN_LOG")
 CHAN_NEWS = os.environ.get("CHAN_NEWS_FLASH")  
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
 
-# Schalter & Werte
 DELETE_OLD_EVENT = os.environ.get("SET_DELETE_OLD_EVENT", "0") == "1"
 EXTRA_GRID_THRESHOLD = int(os.environ.get("SET_EXTRA_GRID_THRESHOLD", 10))
 MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("SET_MIN_GRIDS_MSG", 1))
 MANUAL_LOG_ID = os.environ.get("SET_MANUAL_LOG_ID", "").strip()
+LOG_TIME_SETTING = os.environ.get("LOG_TIME", "24h")
 
-# FIXES LIMIT
 MAX_GRIDS = 4 
-
 APOLLO_BOT_ID = "475744554910351370"
 DRIVERS_PER_GRID = 15
 STATE_FILE = "state.json"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
 app = Flask(__name__)
+
+# --- HELFER FÜR SYNCHRONISIERTEN TEXT ---
+def pick_bilingual_text(env_de, env_en, **kwargs):
+    opts_de = [o.strip() for o in os.environ.get(env_de, "Text fehlt").split(";")]
+    opts_en = [o.strip() for o in os.environ.get(env_en, "Text missing").split(";")]
+    
+    idx = random.randrange(len(opts_de))
+    
+    # Sicherstellung: Falls Index in EN nicht existiert, nimm einen zufälligen EN-Satz
+    if idx < len(opts_en):
+        txt_en = opts_en[idx].format(**kwargs)
+    else:
+        txt_en = random.choice(opts_en).format(**kwargs)
+        
+    txt_de = opts_de[idx].format(**kwargs)
+    return f"🇩🇪 {txt_de}\n🇬🇧 {txt_en}"
+
+# --- ZEIT-HELFER ---
+def get_now(): return datetime.datetime.now(BERLIN_TZ)
+
+def parse_log_time(setting):
+    unit = setting[-1].lower()
+    try:
+        val = int(setting[:-1])
+        if unit == 'h': return datetime.timedelta(hours=val)
+        if unit == 'd': return datetime.timedelta(days=val)
+    except: pass
+    return datetime.timedelta(hours=24)
+
+def filter_log_by_time(log_entries, duration):
+    now = get_now()
+    filtered = []
+    for entry in log_entries:
+        if "|" in entry:
+            ts_str, content = entry.split("|", 1)
+            try:
+                ts = datetime.datetime.fromisoformat(ts_str)
+                if now - ts <= duration:
+                    display_ts = ts.astimezone(BERLIN_TZ).strftime("%a %H:%M").replace("Mon","Mo").replace("Tue","Di").replace("Wed","Mi").replace("Thu","Do").replace("Fri","Fr").replace("Sat","Sa").replace("Sun","So")
+                    filtered.append(f"{display_ts} {content.strip()}")
+            except: pass
+    return filtered
 
 # --- DISCORD API ---
 def discord_post(channel_id, content):
@@ -34,165 +74,133 @@ def discord_post(channel_id, content):
         return res.json().get("id") if res.status_code == 200 else None
     except: return None
 
-def discord_delete(channel_id, msg_id):
-    if not msg_id or not channel_id: return
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{msg_id}"
-    try: requests.delete(url, headers={"Authorization": f"Bot {DISCORD_TOKEN}"})
-    except: pass
-
-def send_or_edit_log(content, current_log_id):
+def send_or_edit_log(state, driver_count, grid_count, is_locked, override_active):
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
-    formatted_content = f"**Logbuch der Anmeldungen:**\n```\n{content}\n```"
-    target_id = MANUAL_LOG_ID if MANUAL_LOG_ID else current_log_id
+    grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
+    
+    if is_locked:
+        if driver_count >= grid_cap:
+            s_de, s_en = "🚫 Grids gesperrt & voll (Warteliste)", "🚫 Grids locked & full (Waitlist)"
+        else:
+            s_de, s_en = "🔴 Grids gesperrt", "🔴 Grids locked"
+    else:
+        s_de, s_en = "🟢 Anmeldung geöffnet", "🟢 Registration open"
+    
+    duration = parse_log_time(LOG_TIME_SETTING)
+    filtered = filter_log_by_time(state.get("log_v2", []), duration)
+    log_content = "\n".join(filtered) if filtered else "Keine Änderungen / No changes."
+    
+    override_label = " (Override)" if override_active else ""
+    
+    formatted = (
+        f"**STATUS / STATE**\n🇩🇪 {s_de}\n🇬🇧 {s_en}\n\n"
+        f"**INFO**\n"
+        f"🇩🇪 Bestätigte Fahrer: `{driver_count}` | Grids: `{grid_count}{override_label}` ({'gesperrt' if is_locked else 'offen'})\n"
+        f"🇬🇧 Confirmed drivers: `{driver_count}` | Grids: `{grid_count}{override_label}` ({'locked' if is_locked else 'open'})\n\n"
+        f"*Änderungen letzten / Changes last {LOG_TIME_SETTING}:*\n```\n{log_content}\n```"
+    )
+    
+    target_id = MANUAL_LOG_ID if MANUAL_LOG_ID else state.get("log_msg_id")
     if target_id:
         url = f"https://discord.com/api/v10/channels/{CHAN_LOG}/messages/{target_id}"
-        res = requests.patch(url, headers=headers, json={"content": formatted_content})
+        res = requests.patch(url, headers=headers, json={"content": formatted})
         if res.status_code == 200: return target_id
-    return discord_post(CHAN_LOG, formatted_content)
+    return discord_post(CHAN_LOG, formatted)
 
-def get_now(): return datetime.datetime.now(BERLIN_TZ)
-def pick_text(env_name, default): 
-    val = os.environ.get(env_name, default)
-    return random.choice([opt.strip() for opt in val.split(";")])
-
-def clean_name(n): return n.replace("\\_", "_").replace("\\*", "*").replace("*", "").strip()
-
+# --- STATE MANAGEMENT ---
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "hash": None, "drivers": [], "log": "", "sent_grids": [], "last_sunday_msg_event": None, "extra_grid_active": False, "log_msg_id": None}
+    return {"event_id": None, "drivers": [], "log_v2": [], "sent_grids": [], "extra_grid_active": False, "log_msg_id": None, "grid_override": None}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
 
 def extract_data(embed):
     drivers = []
-    raw = ""
     for field in embed.get("fields", []):
         name, val = field.get("name", ""), field.get("value", "")
-        raw += f"{name}{val}"
         if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
             for line in val.split("\n"):
                 c = re.sub(r"^\d+[\s.)-]*", "", line.replace(">>>", "").replace(">", "")).strip()
                 if c and "Grid" not in c and len(c) > 1: drivers.append(c)
-    return drivers, raw
+    return drivers
 
-# --- MAIN ---
-def run_check():
+@app.route('/')
+def home():
     if not all([DISCORD_TOKEN, CHAN_APOLLO, CHAN_LOG, CHAN_NEWS]): return "Config Error"
-    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
     try:
-        res = requests.get(f"https://discord.com/api/v10/channels/{CHAN_APOLLO}/messages?limit=10", headers=headers)
-        messages = res.json()
-        apollo_msg = next((m for m in messages if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "Keine Apollo-Nachricht gefunden."
+        url_grid_param = request.args.get('grids', type=int)
+        res = requests.get(f"https://discord.com/api/v10/channels/{CHAN_APOLLO}/messages?limit=10", headers={"Authorization": f"Bot {DISCORD_TOKEN}"})
+        apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
+        if not apollo_msg: return "No Apollo message."
 
-        event_id = apollo_msg["id"]
-        drivers, raw_content = extract_data(apollo_msg["embeds"][0])
-        current_hash = str(hash(raw_content))
+        drivers = extract_data(apollo_msg["embeds"][0])
         state = load_state()
-        ts = f"{['So','Mo','Di','Mi','Do','Fr','Sa'][get_now().isoweekday() % 7]} {get_now().strftime('%H:%M')}"
-        
+        now_iso = get_now().isoformat()
         wd = get_now().weekday()
         is_locked = (wd == 6 and get_now().hour >= 18) or (wd == 0) or (wd == 1 and get_now().hour < 10)
-
-        is_new = (state.get("event_id") and state["event_id"] != event_id)
-        is_first_start = (state.get("event_id") is None)
-        msg_type = "status_trigger"
-        force_send = False
-
-        if is_new or is_first_start:
-            if is_new:
-                if not MANUAL_LOG_ID: discord_delete(CHAN_LOG, state.get("log_msg_id"))
-                if DELETE_OLD_EVENT: discord_delete(CHAN_APOLLO, state["event_id"])
-                state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 📅 Start", "log_msg_id": None, "drivers": []})
-                msg_type = "event_reset"
-                force_send = True
-            elif is_first_start:
-                # Bestehende Fahrer mit grünem Kreis markieren, ohne (Bestand)
-                existing = [f"{ts} 🟢 {clean_name(d)}" for d in drivers]
-                state.update({
-                    "event_id": event_id, 
-                    "sent_grids": [], 
-                    "extra_grid_active": False, 
-                    "log": f"{ts} 🔄 Systemstart\n" + "\n".join(existing), 
-                    "log_msg_id": None, 
-                    "drivers": drivers
-                })
-                msg_type = "initial_load"
-                force_send = True
-
-        driver_count = len(drivers)
-        grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
         
-        if is_locked:
-            effective_drivers = min(driver_count, grid_cap)
-            grid_count = min(MAX_GRIDS, math.ceil(effective_drivers / 15)) if effective_drivers > 0 else 0
-        else:
-            grid_count = min(MAX_GRIDS, math.ceil(driver_count / 15)) if driver_count > 0 else 0
+        # Override Logik
+        if url_grid_param is not None:
+            if url_grid_param == 0:
+                state["grid_override"] = None
+            else:
+                state["grid_override"] = min(url_grid_param, MAX_GRIDS)
 
-        wait_count = max(0, driver_count - grid_cap)
-        grid_full_msg = sunday_msg = waitlist_msg = moved_up_msg = extra_grid_msg = None
-
-        if not state["extra_grid_active"] and (wd in [6,0,1]) and wait_count >= EXTRA_GRID_THRESHOLD:
-            state["extra_grid_active"] = True
-            extra_grid_msg = pick_text("MSG_EXTRA_GRID_TEXT", "Zusatzgrid eröffnet!").format(waitlist_count=wait_count)
-            discord_post(CHAN_NEWS, extra_grid_msg)
-            force_send = True
-
-        if driver_count > 0 and driver_count % 15 == 0:
-            full = driver_count // 15
-            if full <= MAX_GRIDS and full >= MIN_GRIDS_FOR_MESSAGE and full not in state["sent_grids"]:
-                grid_full_msg = pick_text("MSG_GRID_FULL_TEXT", "Grid {full_grids} voll").format(full_grids=full)
-                discord_post(CHAN_NEWS, grid_full_msg)
-                state["sent_grids"].append(full)
-                force_send = True
-
-        if wd == 6 and get_now().hour == 18 and get_now().minute < 10:
-            if state.get("last_sunday_msg_event") != event_id:
-                free = max(0, grid_cap - driver_count)
-                sunday_msg = pick_text("MSG_SUNDAY_TEXT", "Sonntag 18h Report").format(driver_count=driver_count, free_slots=free)
-                discord_post(CHAN_LOG, sunday_msg)
-                state["last_sunday_msg_event"] = event_id
-                force_send = True
+        is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
+        if is_new or state.get("event_id") is None:
+            state.update({"event_id": apollo_msg["id"], "sent_grids": [], "log_v2": [], "drivers": [], "grid_override": None})
+            for d in drivers: state["log_v2"].append(f"{now_iso}|🟢 {clean_name(d)}")
 
         old = state.get("drivers", [])
         added = [d for d in drivers if d not in old]
         removed = [d for d in old if d not in drivers]
-        
-        if added or removed:
-            state["log"] += "\n" + "\n".join([f"{ts} 🟢 {clean_name(d)}" for d in added] + [f"{ts} 🔴 {clean_name(d)}" for d in removed])
-            if is_locked:
-                wait_list = [clean_name(d) for d in added if drivers.index(d) >= grid_cap]
-                if wait_list:
-                    waitlist_msg = pick_text("MSG_WAITLIST_SINGLE" if len(wait_list)==1 else "MSG_WAITLIST_MULTI", "Warteliste Update").format(driver_names=", ".join(wait_list))
-                    discord_post(CHAN_NEWS, waitlist_msg)
-                up = [clean_name(d) for i, d in enumerate(drivers) if i < grid_cap and d in old and old.index(d) >= grid_cap]
-                if up:
-                    moved_up_msg = pick_text("MSG_MOVED_UP_SINGLE" if len(up)==1 else "MSG_MOVED_UP_MULTI", "Nachgerückt").format(driver_names=", ".join(up))
-                    discord_post(CHAN_NEWS, moved_up_msg)
-            msg_type = "roster_update"
+        for d in added: state["log_v2"].append(f"{now_iso}|🟢 {clean_name(d)}")
+        for d in removed: state["log_v2"].append(f"{now_iso}|🔴 {clean_name(d)}")
 
-        if state.get("hash") != current_hash or force_send:
-            state["log_msg_id"] = send_or_edit_log(state["log"], state.get("log_msg_id"))
-            state["hash"] = current_hash
-            state["drivers"] = drivers
-            save_state(state)
-            
-            if MAKE_WEBHOOK_URL:
-                payload = {"type": msg_type, "driver_count": driver_count, "drivers": drivers, "grids": grid_count, "log": state["log"], "grid_full_msg": grid_full_msg, "sunday_msg": sunday_msg, "waitlist_msg": waitlist_msg, "moved_up_msg": moved_up_msg, "extra_grid_msg": extra_grid_msg, "timestamp": get_now().isoformat()}
-                requests.post(MAKE_WEBHOOK_URL, json=payload)
-            
-            res_txt = f"Aktion: {msg_type} (Fahrer: {driver_count}, Grids: {grid_count})<br>"
-            if added: res_txt += f"🟢 Neu: {', '.join([clean_name(d) for d in added])}<br>"
-            if removed: res_txt += f"🔴 Weg: {', '.join([clean_name(d) for d in removed])}<br>"
-            return res_txt
+        driver_count, grid_cap = len(drivers), MAX_GRIDS * DRIVERS_PER_GRID
         
-        return f"Keine Änderungen. Fahrer: {driver_count} (Grids: {grid_count})"
-    except Exception as e: return f"Fehler: {str(e)}"
+        # Grid Berechnung
+        override_active = state.get("grid_override") is not None
+        if override_active:
+            grid_count = state["grid_override"]
+        else:
+            grid_count = min(math.ceil(driver_count/15), MAX_GRIDS)
 
-@app.route('/')
-def home(): return run_check()
+        # News & Log Updates
+        news_msg = None
+        if not state["extra_grid_active"] and (wd in [6,0,1]) and (driver_count - 60 >= EXTRA_GRID_THRESHOLD):
+            state["extra_grid_active"] = True
+            news_msg = pick_bilingual_text("MSG_EXTRA_GRID_TEXT", "MSG_EXTRA_GRID_TEXT_EN", waitlist_count=driver_count-60)
+        
+        if driver_count > 0 and driver_count % 15 == 0:
+            full = driver_count // 15
+            if full <= MAX_GRIDS and full >= MIN_GRIDS_FOR_MESSAGE and full not in state["sent_grids"]:
+                news_msg = pick_bilingual_text("MSG_GRID_FULL_TEXT", "MSG_GRID_FULL_TEXT_EN", full_grids=full)
+                state["sent_grids"].append(full)
+
+        if is_locked and (added or removed):
+            wait_list = [clean_name(d) for d in added if drivers.index(d) >= grid_cap]
+            if wait_list:
+                v_de = "MSG_WAITLIST_SINGLE" if len(wait_list)==1 else "MSG_WAITLIST_MULTI"
+                news_msg = pick_bilingual_text(v_de, v_de+"_EN", driver_names=", ".join(wait_list))
+            
+            up = [clean_name(d) for i, d in enumerate(drivers) if i < grid_cap and d in old and old.index(d) >= grid_cap]
+            if up:
+                v_de = "MSG_MOVED_UP_SINGLE" if len(up)==1 else "MSG_MOVED_UP_MULTI"
+                news_msg = pick_bilingual_text(v_de, v_de+"_EN", driver_names=", ".join(up))
+
+        if news_msg: discord_post(CHAN_NEWS, news_msg)
+
+        state["log_msg_id"] = send_or_edit_log(state, driver_count, grid_count, is_locked, override_active)
+        state["drivers"] = drivers
+        save_state(state)
+        
+        res_info = f"Grids: {grid_count}" + (" (OVERRIDE)" if override_active else "")
+        return f"OK - {res_info}"
+    except Exception as e: return str(e)
+
 if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
