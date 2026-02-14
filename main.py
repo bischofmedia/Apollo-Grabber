@@ -1,18 +1,20 @@
 import os, requests, json, re, math, datetime, pytz, random
 from flask import Flask
 
-# --- KONFIGURATION (Render Environment Variables) ---
+# --- KONFIGURATION ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-CHAN_LOG = os.environ.get("CHAN_MAIN_LOG")
-CHAN_NEWS = os.environ.get("CHAN_NEWS_FLASH")
+CHAN_APOLLO = os.environ.get("CHAN_APOLLO") 
+CHAN_LOG = os.environ.get("CHAN_MAIN_LOG")    
+CHAN_NEWS = os.environ.get("CHAN_NEWS_FLASH")  
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
 
-# Schalter & Werte (Präfix SET_)
+# Schalter & Werte
 DELETE_OLD_EVENT = os.environ.get("SET_DELETE_OLD_EVENT", "0") == "1"
 EXTRA_GRID_THRESHOLD = int(os.environ.get("SET_EXTRA_GRID_THRESHOLD", 10))
 MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("SET_MIN_GRIDS_MSG", 1))
+MANUAL_LOG_ID = os.environ.get("SET_MANUAL_LOG_ID", "").strip() # Manuelle ID
 
-# Texte (Präfix MSG_)
+# Texte
 GRID_FULL_TEXT = os.environ.get("MSG_GRID_FULL_TEXT", "Grid {full_grids} ist voll!")
 SUNDAY_MSG_TEXT = os.environ.get("MSG_SUNDAY_TEXT", "Sonntag 18 Uhr: {driver_count} Fahrer.")
 WAITLIST_SINGLE = os.environ.get("MSG_WAITLIST_SINGLE", "Warteliste: {driver_names} ist neu.")
@@ -23,33 +25,45 @@ EXTRA_GRID_TEXT = os.environ.get("MSG_EXTRA_GRID_TEXT", "Zusatzgrid eröffnet!")
 
 APOLLO_BOT_ID = "475744554910351370"
 DRIVERS_PER_GRID = 15
-MAX_GRIDS = 4
 STATE_FILE = "state.json"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
 app = Flask(__name__)
 
-# --- DISCORD AKTIONEN ---
+# --- DISCORD API ---
 def discord_post(channel_id, content):
-    if not content or not channel_id: return
+    if not content or not channel_id: return None
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
-    res = requests.post(url, headers=headers, json={"content": content})
-    return res.json().get("id") if res.status_code == 200 else None
+    try:
+        res = requests.post(url, headers=headers, json={"content": content})
+        return res.json().get("id") if res.status_code == 200 else None
+    except: return None
 
 def discord_delete(channel_id, msg_id):
     if not msg_id or not channel_id: return
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{msg_id}"
-    requests.delete(url, headers={"Authorization": f"Bot {DISCORD_TOKEN}"})
+    try: requests.delete(url, headers={"Authorization": f"Bot {DISCORD_TOKEN}"})
+    except: pass
 
-def send_or_edit_log(content, current_log_id, state):
+def send_or_edit_log(content, current_log_id):
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
-    payload = {"content": f"**Logbuch der Anmeldungen:**\n```\n{content}\n```"}
+    formatted_content = f"**Logbuch der Anmeldungen:**\n```\n{content}\n```"
+    
+    # 1. Fall: Manuelle ID ist vorgegeben
+    if MANUAL_LOG_ID:
+        url = f"https://discord.com/api/v10/channels/{CHAN_LOG}/messages/{MANUAL_LOG_ID}"
+        res = requests.patch(url, headers=headers, json={"content": formatted_content})
+        return MANUAL_LOG_ID # Wir bleiben bei der manuellen ID
+    
+    # 2. Fall: Editieren einer vom Script erstellten Nachricht
     if current_log_id:
         url = f"https://discord.com/api/v10/channels/{CHAN_LOG}/messages/{current_log_id}"
-        res = requests.patch(url, headers=headers, json=payload)
+        res = requests.patch(url, headers=headers, json={"content": formatted_content})
         if res.status_code == 200: return current_log_id
-    return discord_post(CHAN_LOG, payload["content"])
+    
+    # 3. Fall: Neu posten (wenn keine ID da oder Edit fehlschlug)
+    return discord_post(CHAN_LOG, formatted_content)
 
 # --- HELFER ---
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
@@ -80,26 +94,31 @@ def extract_data(embed):
 
 # --- MAIN ---
 def run_check():
-    if not all([DISCORD_TOKEN, CHAN_LOG, CHAN_NEWS]): return "Config Error"
+    if not all([DISCORD_TOKEN, CHAN_APOLLO, CHAN_LOG, CHAN_NEWS]): return "Config Error"
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
     try:
-        res = requests.get(f"https://discord.com/api/v10/channels/{CHAN_LOG}/messages?limit=10", headers=headers)
+        res = requests.get(f"https://discord.com/api/v10/channels/{CHAN_APOLLO}/messages?limit=10", headers=headers)
         messages = res.json()
         apollo_msg = next((m for m in messages if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "No Apollo message"
+        if not apollo_msg: return "No Apollo message found"
 
         event_id = apollo_msg["id"]
         drivers, raw_content = extract_data(apollo_msg["embeds"][0])
         current_hash = str(hash(raw_content))
         state = load_state()
-        ts = f"{['Mo','Di','Mi','Do','Fr','Sa','So'][get_now().weekday()]} {get_now().strftime('%H:%M')}"
+        ts = f"{['So','Mo','Di','Mi','Do','Fr','Sa'][get_now().isoweekday() % 7]} {get_now().strftime('%H:%M')}"
         
         is_new = (state.get("event_id") and state["event_id"] != event_id)
+        
         if is_new or not state.get("event_id"):
-            if is_new:
+            # LÖSCH-LOGIK: Nur wenn keine manuelle ID gesetzt ist
+            if not MANUAL_LOG_ID:
                 discord_delete(CHAN_LOG, state.get("log_msg_id"))
-                if DELETE_OLD_EVENT: discord_delete(CHAN_LOG, state["event_id"])
-            state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 📅 Start", "log_msg_id": None, "drivers": []})
+            
+            if is_new and DELETE_OLD_EVENT: 
+                discord_delete(CHAN_APOLLO, state["event_id"])
+                
+            state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 📅 Start", "log_msg_id": None, "drivers": drivers if not is_new else []})
 
         driver_count = len(drivers)
         grid_cap = 75 if state["extra_grid_active"] else 60
@@ -144,9 +163,11 @@ def run_check():
                     txt = MOVED_UP_SINGLE if len(up) == 1 else MOVED_UP_MULTI
                     discord_post(CHAN_NEWS, pick_text(txt).format(driver_names=", ".join(up)))
 
+        # Log-Update
         if state.get("hash") != current_hash:
-            state["log_msg_id"] = send_or_edit_log(state["log"], state.get("log_msg_id"), state)
+            state["log_msg_id"] = send_or_edit_log(state["log"], state.get("log_msg_id"))
             state["hash"] = current_hash
+            state["drivers"] = drivers
             save_state(state)
             if MAKE_WEBHOOK_URL: requests.post(MAKE_WEBHOOK_URL, json={"status": "updated", "drivers": driver_count})
         
