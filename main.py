@@ -63,6 +63,7 @@ def filter_log_by_time(log_entries, duration):
 def send_or_edit_log(state, driver_count, grid_count, is_locked, override_active):
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
     grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
+    now = get_now()
     
     # Kreis-Logik & Status
     if is_locked:
@@ -81,10 +82,14 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, override_active
     log_content = "\n".join(filtered) if filtered else "Keine Änderungen / No changes."
     ov = " (Override)" if override_active else ""
     
+    # Letzte Aktualisierung
+    update_ts = now.strftime("%H:%M:%S")
+    
     formatted = (
         f"{icon} **{status}**\n"
         f"Fahrer / Drivers: `{driver_count}` | Grids: `{grid_count}{ov}` ({'gesperrt / locked' if is_locked else 'offen / open'})\n\n"
-        f"*Änderungen der letzten {LOG_TIME_SETTING}:*\n```\n{log_content}\n```"
+        f"*Änderungen der letzten {LOG_TIME_SETTING}:*\n```\n{log_content}\n```\n"
+        f"*Stand: {update_ts}*"
     )
     
     target_id = MANUAL_LOG_ID if MANUAL_LOG_ID else state.get("log_msg_id")
@@ -151,7 +156,7 @@ def home():
         if is_new or state.get("event_id") is None:
             state.update({"event_id": apollo_msg["id"], "sent_grids": [], "log_v2": [], "drivers": drivers, "grid_override": None, "extra_grid_active": False})
             for d in drivers: state["log_v2"].append(f"{now_iso}|🟢 {clean_name(d)}")
-            added, removed = [], [] # Verhindert Doppellistung beim ersten Run
+            added, removed = [], [] 
         else:
             old = state.get("drivers", [])
             added, removed = [d for d in drivers if d not in old], [d for d in old if d not in drivers]
@@ -181,11 +186,12 @@ def home():
             url = f"https://discord.com/api/v10/channels/{CHAN_NEWS}/messages"
             requests.post(url, headers={"Authorization": f"Bot {DISCORD_TOKEN}"}, json={"content": news_msg})
 
-        # Update
+        # Update Log
         state["log_msg_id"] = send_or_edit_log(state, driver_count, grid_count, is_locked, override_active)
         state["drivers"] = drivers
         save_state(state)
         
+        # Webhook Sparlogik
         if MAKE_WEBHOOK_URL and (added or removed or url_grid_param is not None or is_new):
             requests.post(MAKE_WEBHOOK_URL, json={"type": "update", "driver_count": driver_count, "drivers": drivers, "grids": grid_count, "override": override_active, "timestamp": now_iso})
         
