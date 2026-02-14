@@ -26,19 +26,11 @@ app = Flask(__name__)
 def pick_bilingual_text(env_de, env_en, **kwargs):
     opts_de = [o.strip() for o in os.environ.get(env_de, "Text fehlt").split(";")]
     opts_en = [o.strip() for o in os.environ.get(env_en, "Text missing").split(";")]
-    
     idx = random.randrange(len(opts_de))
-    
-    # Sicherstellung: Falls Index in EN nicht existiert, nimm einen zufälligen EN-Satz
-    if idx < len(opts_en):
-        txt_en = opts_en[idx].format(**kwargs)
-    else:
-        txt_en = random.choice(opts_en).format(**kwargs)
-        
+    txt_en = opts_en[idx].format(**kwargs) if idx < len(opts_en) else random.choice(opts_en).format(**kwargs)
     txt_de = opts_de[idx].format(**kwargs)
     return f"🇩🇪 {txt_de}\n🇬🇧 {txt_en}"
 
-# --- ZEIT-HELFER ---
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
 
 def parse_log_time(setting):
@@ -79,17 +71,13 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, override_active
     grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
     
     if is_locked:
-        if driver_count >= grid_cap:
-            s_de, s_en = "🚫 Grids gesperrt & voll (Warteliste)", "🚫 Grids locked & full (Waitlist)"
-        else:
-            s_de, s_en = "🔴 Grids gesperrt", "🔴 Grids locked"
+        s_de, s_en = ("🚫 Grids gesperrt & voll (Warteliste)", "🚫 Grids locked & full (Waitlist)") if driver_count >= grid_cap else ("🔴 Grids gesperrt", "🔴 Grids locked")
     else:
-        s_de, s_en = "🟢 Anmeldung geöffnet", "🟢 Registration open"
+        s_de, s_en = ("🟢 Anmeldung geöffnet", "🟢 Registration open")
     
     duration = parse_log_time(LOG_TIME_SETTING)
     filtered = filter_log_by_time(state.get("log_v2", []), duration)
     log_content = "\n".join(filtered) if filtered else "Keine Änderungen / No changes."
-    
     override_label = " (Override)" if override_active else ""
     
     formatted = (
@@ -121,9 +109,8 @@ def save_state(s):
 def extract_data(embed):
     drivers = []
     for field in embed.get("fields", []):
-        name, val = field.get("name", ""), field.get("value", "")
-        if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
-            for line in val.split("\n"):
+        if any(kw in field.get("name", "") for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
+            for line in field.get("value", "").split("\n"):
                 c = re.sub(r"^\d+[\s.)-]*", "", line.replace(">>>", "").replace(">", "")).strip()
                 if c and "Grid" not in c and len(c) > 1: drivers.append(c)
     return drivers
@@ -145,10 +132,7 @@ def home():
         
         # Override Logik
         if url_grid_param is not None:
-            if url_grid_param == 0:
-                state["grid_override"] = None
-            else:
-                state["grid_override"] = min(url_grid_param, MAX_GRIDS)
+            state["grid_override"] = min(url_grid_param, MAX_GRIDS) if url_grid_param > 0 else None
 
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
         if is_new or state.get("event_id") is None:
@@ -156,51 +140,50 @@ def home():
             for d in drivers: state["log_v2"].append(f"{now_iso}|🟢 {clean_name(d)}")
 
         old = state.get("drivers", [])
-        added = [d for d in drivers if d not in old]
-        removed = [d for d in old if d not in drivers]
+        added, removed = [d for d in drivers if d not in old], [d for d in old if d not in drivers]
         for d in added: state["log_v2"].append(f"{now_iso}|🟢 {clean_name(d)}")
         for d in removed: state["log_v2"].append(f"{now_iso}|🔴 {clean_name(d)}")
 
         driver_count, grid_cap = len(drivers), MAX_GRIDS * DRIVERS_PER_GRID
-        
-        # Grid Berechnung
         override_active = state.get("grid_override") is not None
-        if override_active:
-            grid_count = state["grid_override"]
-        else:
-            grid_count = min(math.ceil(driver_count/15), MAX_GRIDS)
+        grid_count = state["grid_override"] if override_active else min(math.ceil(driver_count/15), MAX_GRIDS)
 
-        # News & Log Updates
+        # News & Discord Updates
         news_msg = None
         if not state["extra_grid_active"] and (wd in [6,0,1]) and (driver_count - 60 >= EXTRA_GRID_THRESHOLD):
             state["extra_grid_active"] = True
             news_msg = pick_bilingual_text("MSG_EXTRA_GRID_TEXT", "MSG_EXTRA_GRID_TEXT_EN", waitlist_count=driver_count-60)
-        
-        if driver_count > 0 and driver_count % 15 == 0:
-            full = driver_count // 15
-            if full <= MAX_GRIDS and full >= MIN_GRIDS_FOR_MESSAGE and full not in state["sent_grids"]:
-                news_msg = pick_bilingual_text("MSG_GRID_FULL_TEXT", "MSG_GRID_FULL_TEXT_EN", full_grids=full)
-                state["sent_grids"].append(full)
+        elif driver_count > 0 and driver_count % 15 == 0 and (driver_count // 15) <= MAX_GRIDS and (driver_count // 15) not in state["sent_grids"]:
+            news_msg = pick_bilingual_text("MSG_GRID_FULL_TEXT", "MSG_GRID_FULL_TEXT_EN", full_grids=driver_count//15)
+            state["sent_grids"].append(driver_count // 15)
 
         if is_locked and (added or removed):
             wait_list = [clean_name(d) for d in added if drivers.index(d) >= grid_cap]
-            if wait_list:
-                v_de = "MSG_WAITLIST_SINGLE" if len(wait_list)==1 else "MSG_WAITLIST_MULTI"
-                news_msg = pick_bilingual_text(v_de, v_de+"_EN", driver_names=", ".join(wait_list))
-            
+            if wait_list: news_msg = pick_bilingual_text("MSG_WAITLIST_SINGLE" if len(wait_list)==1 else "MSG_WAITLIST_MULTI", "MSG_WAITLIST_SINGLE_EN" if len(wait_list)==1 else "MSG_WAITLIST_MULTI_EN", driver_names=", ".join(wait_list))
             up = [clean_name(d) for i, d in enumerate(drivers) if i < grid_cap and d in old and old.index(d) >= grid_cap]
-            if up:
-                v_de = "MSG_MOVED_UP_SINGLE" if len(up)==1 else "MSG_MOVED_UP_MULTI"
-                news_msg = pick_bilingual_text(v_de, v_de+"_EN", driver_names=", ".join(up))
+            if up: news_msg = pick_bilingual_text("MSG_MOVED_UP_SINGLE" if len(up)==1 else "MSG_MOVED_UP_MULTI", "MSG_MOVED_UP_SINGLE_EN" if len(up)==1 else "MSG_MOVED_UP_MULTI_EN", driver_names=", ".join(up))
 
         if news_msg: discord_post(CHAN_NEWS, news_msg)
 
+        # Discord Log immer bearbeiten
         state["log_msg_id"] = send_or_edit_log(state, driver_count, grid_count, is_locked, override_active)
         state["drivers"] = drivers
         save_state(state)
         
-        res_info = f"Grids: {grid_count}" + (" (OVERRIDE)" if override_active else "")
-        return f"OK - {res_info}"
+        # Make Webhook NUR bei echten Änderungen senden
+        if MAKE_WEBHOOK_URL and (added or removed or url_grid_param is not None or is_new):
+            payload = {
+                "type": "roster_update" if not is_new else "event_reset",
+                "driver_count": driver_count,
+                "drivers": drivers,
+                "grids": grid_count,
+                "override": override_active,
+                "timestamp": now_iso
+            }
+            requests.post(MAKE_WEBHOOK_URL, json=payload)
+        
+        return f"OK - Grids: {grid_count}" + (" (OVERRIDE)" if override_active else "")
     except Exception as e: return str(e)
 
+def clean_name(n): return n.replace("\\_", "_").replace("\\*", "*").replace("*", "").strip()
 if __name__ == "__main__": app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
