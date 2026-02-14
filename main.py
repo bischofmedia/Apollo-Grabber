@@ -1,28 +1,25 @@
 import os, requests, json, re, math, datetime, pytz, random
 from flask import Flask
 
-# --- KONFIGURATION ---
+# --- KONFIGURATION (Render Environment Variables) ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
+CHAN_LOG = os.environ.get("CHAN_MAIN_LOG")
+CHAN_NEWS = os.environ.get("CHAN_NEWS_FLASH")
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL")
 
-# Schalter (0/1)
-DELETE_OLD_EVENT = os.environ.get("DELETE_OLD_EVENT", "0") == "1"
-ENABLE_SUNDAY_MSG = os.environ.get("ENABLE_SUNDAY_MSG", "1") == "1"
-ENABLE_GRID_FULL_MSG = os.environ.get("ENABLE_GRID_FULL_MSG", "1") == "1"
-ENABLE_WAITLIST_MSG = os.environ.get("ENABLE_WAITLIST_MSG", "0") == "1"
-ENABLE_EXTRA_GRID = os.environ.get("ENABLE_EXTRA_GRID", "0") == "1"
+# Schalter & Werte (Präfix SET_)
+DELETE_OLD_EVENT = os.environ.get("SET_DELETE_OLD_EVENT", "0") == "1"
+EXTRA_GRID_THRESHOLD = int(os.environ.get("SET_EXTRA_GRID_THRESHOLD", 10))
+MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("SET_MIN_GRIDS_MSG", 1))
 
-# Texte & Werte
-GRID_FULL_TEXT = os.environ.get("GRID_FULL_TEXT", "Grid {full_grids} ist voll!")
-SUNDAY_MSG_TEXT = os.environ.get("SUNDAY_MSG_TEXT", "Sonntag 18 Uhr: {driver_count} Fahrer.")
-WAITLIST_TEXT_SINGLE = os.environ.get("WAITLIST_TEXT_SINGLE", "Warteliste: {driver_names} ist neu dabei.")
-WAITLIST_TEXT_MULTI = os.environ.get("WAITLIST_TEXT_MULTI", "Warteliste: {driver_names} sind neu dabei.")
-MOVED_UP_TEXT_SINGLE = os.environ.get("MOVED_UP_TEXT_SINGLE", "{driver_names} ist nachgerückt!")
-MOVED_UP_TEXT_MULTI = os.environ.get("MOVED_UP_TEXT_MULTI", "{driver_names} sind nachgerückt!")
-EXTRA_GRID_TEXT = os.environ.get("EXTRA_GRID_TEXT", "Zusatzgrid eröffnet!")
-EXTRA_GRID_THRESHOLD = int(os.environ.get("EXTRA_GRID_THRESHOLD", 10))
-MIN_GRIDS_FOR_MESSAGE = int(os.environ.get("MIN_GRIDS_FOR_MESSAGE", 1))
+# Texte (Präfix MSG_)
+GRID_FULL_TEXT = os.environ.get("MSG_GRID_FULL_TEXT", "Grid {full_grids} ist voll!")
+SUNDAY_MSG_TEXT = os.environ.get("MSG_SUNDAY_TEXT", "Sonntag 18 Uhr: {driver_count} Fahrer.")
+WAITLIST_SINGLE = os.environ.get("MSG_WAITLIST_SINGLE", "Warteliste: {driver_names} ist neu.")
+WAITLIST_MULTI = os.environ.get("MSG_WAITLIST_MULTI", "Warteliste: {driver_names} sind neu.")
+MOVED_UP_SINGLE = os.environ.get("MSG_MOVED_UP_SINGLE", "{driver_names} ist nachgerückt!")
+MOVED_UP_MULTI = os.environ.get("MSG_MOVED_UP_MULTI", "{driver_names} sind nachgerückt!")
+EXTRA_GRID_TEXT = os.environ.get("MSG_EXTRA_GRID_TEXT", "Zusatzgrid eröffnet!")
 
 APOLLO_BOT_ID = "475744554910351370"
 DRIVERS_PER_GRID = 15
@@ -32,162 +29,129 @@ BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
 app = Flask(__name__)
 
-def get_now(): return datetime.datetime.now(BERLIN_TZ)
-def get_log_timestamp():
-    days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
-    now = get_now()
-    return f"{days[now.weekday()]} {now.strftime('%H:%M')}"
+# --- DISCORD AKTIONEN ---
+def discord_post(channel_id, content):
+    if not content or not channel_id: return
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
+    res = requests.post(url, headers=headers, json={"content": content})
+    return res.json().get("id") if res.status_code == 200 else None
 
-def grid_locked():
-    now = get_now()
-    wd = now.weekday()
-    return (wd == 6 and now.hour >= 18) or (wd == 0) or (wd == 1 and now.hour < 10)
-
-def pick_text(env_value):
-    """Sucht zufällig einen Text aus einer durch Semikolon getrennten Liste aus."""
-    options = [opt.strip() for opt in env_value.split(";")]
-    return random.choice(options)
-
-def clean_log_name(name):
-    return name.replace("\\_", "_").replace("\\*", "*").replace("*", "").strip()
-
-def delete_discord_message(msg_id):
-    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages/{msg_id}"
+def discord_delete(channel_id, msg_id):
+    if not msg_id or not channel_id: return
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{msg_id}"
     requests.delete(url, headers={"Authorization": f"Bot {DISCORD_TOKEN}"})
+
+def send_or_edit_log(content, current_log_id, state):
+    headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
+    payload = {"content": f"**Logbuch der Anmeldungen:**\n```\n{content}\n```"}
+    if current_log_id:
+        url = f"https://discord.com/api/v10/channels/{CHAN_LOG}/messages/{current_log_id}"
+        res = requests.patch(url, headers=headers, json=payload)
+        if res.status_code == 200: return current_log_id
+    return discord_post(CHAN_LOG, payload["content"])
+
+# --- HELFER ---
+def get_now(): return datetime.datetime.now(BERLIN_TZ)
+def pick_text(env_value): return random.choice([opt.strip() for opt in env_value.split(";")])
+def clean_name(n): return n.replace("\\_", "_").replace("\\*", "*").replace("*", "").strip()
 
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r") as f:
-                d = json.load(f)
-                d.setdefault("sent_grids", [])
-                d.setdefault("last_sunday_msg_event", None)
-                d.setdefault("extra_grid_active", False)
-                return d
+            with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "hash": None, "drivers": [], "grids": 1, "log": "", "sent_grids": [], "last_sunday_msg_event": None, "extra_grid_active": False}
+    return {"event_id": None, "hash": None, "drivers": [], "log": "", "sent_grids": [], "last_sunday_msg_event": None, "extra_grid_active": False, "log_msg_id": None}
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f: json.dump(state, f)
+def save_state(s):
+    with open(STATE_FILE, "w") as f: json.dump(s, f)
 
-def extract_data_from_embed(embed):
-    fields = embed.get("fields", [])
-    all_drivers = []
-    full_text_for_hash = ""
-    for field in fields:
-        name, value = field.get("name", ""), field.get("value", "")
-        full_text_for_hash += f"{name}{value}"
+def extract_data(embed):
+    drivers = []
+    raw = ""
+    for field in embed.get("fields", []):
+        name, val = field.get("name", ""), field.get("value", "")
+        raw += f"{name}{val}"
         if any(kw in name for kw in ["Accepted", "Anmeldung", "Teilnehmer", "Confirmed", "Zusagen"]):
-            lines = [l.strip() for l in value.split("\n") if l.strip()]
-            for line in lines:
-                clean_name = line.replace(">>>", "").replace(">", "")
-                clean_name = re.sub(r"^\d+[\s.)-]*", "", clean_name).strip()
-                if clean_name and "Grid" not in clean_name and len(clean_name) > 1:
-                    all_drivers.append(clean_name)
-    return all_drivers, full_text_for_hash
+            for line in val.split("\n"):
+                c = re.sub(r"^\d+[\s.)-]*", "", line.replace(">>>", "").replace(">", "")).strip()
+                if c and "Grid" not in c and len(c) > 1: drivers.append(c)
+    return drivers, raw
 
+# --- MAIN ---
 def run_check():
-    if not all([DISCORD_TOKEN, CHANNEL_ID, MAKE_WEBHOOK_URL]): return "Missing Config"
+    if not all([DISCORD_TOKEN, CHAN_LOG, CHAN_NEWS]): return "Config Error"
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
-    url = f"https://discord.com/api/v10/channels/{CHANNEL_ID}/messages?limit=10"
-    
     try:
-        response = requests.get(url, headers=headers)
-        messages = response.json()
+        res = requests.get(f"https://discord.com/api/v10/channels/{CHAN_LOG}/messages?limit=10", headers=headers)
+        messages = res.json()
         apollo_msg = next((m for m in messages if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
         if not apollo_msg: return "No Apollo message"
 
         event_id = apollo_msg["id"]
-        drivers, raw_content = extract_data_from_embed(apollo_msg["embeds"][0])
+        drivers, raw_content = extract_data(apollo_msg["embeds"][0])
         current_hash = str(hash(raw_content))
         state = load_state()
+        ts = f"{['Mo','Di','Mi','Do','Fr','Sa','So'][get_now().weekday()]} {get_now().strftime('%H:%M')}"
         
-        now_dt = get_now()
-        ts = get_log_timestamp()
-        is_new_event = (state.get("event_id") != event_id)
-        
-        grid_full_msg = sunday_msg = waitlist_msg = moved_up_msg = extra_grid_msg = None
-        force_send = False
-
-        if is_new_event:
-            if DELETE_OLD_EVENT and state["event_id"]: delete_discord_message(state["event_id"])
-            state.update({"sent_grids": [], "last_sunday_msg_event": None, "extra_grid_active": False, "log": f"{ts} 📅 Apollo gestartet"})
-            msg_type, force_send = "event_reset", True
-        else:
-            msg_type = "status_trigger"
+        is_new = (state.get("event_id") and state["event_id"] != event_id)
+        if is_new or not state.get("event_id"):
+            if is_new:
+                discord_delete(CHAN_LOG, state.get("log_msg_id"))
+                if DELETE_OLD_EVENT: discord_delete(CHAN_LOG, state["event_id"])
+            state.update({"event_id": event_id, "sent_grids": [], "extra_grid_active": False, "log": f"{ts} 📅 Start", "log_msg_id": None, "drivers": []})
 
         driver_count = len(drivers)
-        current_max_grids = 5 if state["extra_grid_active"] else MAX_GRIDS
-        grid_capacity = current_max_grids * DRIVERS_PER_GRID
-        grids = min(current_max_grids, max(1, math.ceil(driver_count / DRIVERS_PER_GRID)))
-        waitlist_count = max(0, driver_count - (MAX_GRIDS * DRIVERS_PER_GRID))
+        grid_cap = 75 if state["extra_grid_active"] else 60
+        wait_count = max(0, driver_count - 60)
 
-        # Extra Grid Check
-        if ENABLE_EXTRA_GRID and not state["extra_grid_active"] and grid_locked():
-            if waitlist_count >= EXTRA_GRID_THRESHOLD:
-                state["extra_grid_active"] = True
-                extra_grid_msg = pick_text(EXTRA_GRID_TEXT).format(waitlist_count=waitlist_count)
-                grids = 5
-                grid_capacity = 75
-                force_send = True
+        # 1. Extra Grid
+        if not state["extra_grid_active"] and (get_now().weekday() in [6,0,1]) and wait_count >= EXTRA_GRID_THRESHOLD:
+            state["extra_grid_active"] = True
+            discord_post(CHAN_NEWS, pick_text(EXTRA_GRID_TEXT).format(waitlist_count=wait_count))
+            grid_cap = 75
 
-        # Grid Voll Check
-        if ENABLE_GRID_FULL_MSG and driver_count > 0 and driver_count % DRIVERS_PER_GRID == 0:
-            full_grids_count = driver_count // DRIVERS_PER_GRID
-            if full_grids_count >= MIN_GRIDS_FOR_MESSAGE and full_grids_count not in state["sent_grids"]:
-                grid_full_msg = pick_text(GRID_FULL_TEXT).format(driver_count=driver_count, full_grids=full_grids_count)
-                state["sent_grids"].append(full_grids_count)
-                force_send = True
+        # 2. Grid Voll
+        if driver_count > 0 and driver_count % 15 == 0:
+            full = driver_count // 15
+            if full >= MIN_GRIDS_FOR_MESSAGE and full not in state["sent_grids"]:
+                discord_post(CHAN_NEWS, pick_text(GRID_FULL_TEXT).format(full_grids=full))
+                state["sent_grids"].append(full)
 
-        # Sonntag 18 Uhr
-        if ENABLE_SUNDAY_MSG and now_dt.weekday() == 6 and now_dt.hour == 18 and now_dt.minute < 10:
-            if state["last_sunday_msg_event"] != event_id:
-                free = max(0, grid_capacity - driver_count)
-                sunday_msg = pick_text(SUNDAY_MSG_TEXT).format(driver_count=driver_count, grids=grids, free_slots=free)
+        # 3. Sonntag 18 Uhr
+        if get_now().weekday() == 6 and get_now().hour == 18 and get_now().minute < 10:
+            if state.get("last_sunday_msg_event") != event_id:
+                free = max(0, grid_cap - driver_count)
+                discord_post(CHAN_LOG, pick_text(SUNDAY_MSG_TEXT).format(driver_count=driver_count, free_slots=free))
                 state["last_sunday_msg_event"] = event_id
-                force_send = True
 
-        old_drivers = state.get("drivers", [])
-        added = [d for d in drivers if d not in old_drivers]
-        removed = [d for d in old_drivers if d not in drivers]
-
+        # 4. Roster Update
+        old = state.get("drivers", [])
+        added = [d for d in drivers if d not in old]
+        removed = [d for d in old if d not in drivers]
         if added or removed:
-            msg_type, force_send = "roster_update", True
-            new_entries = [f"{ts} 🟢 {clean_log_name(d)}" for d in added] + [f"{ts} 🔴 {clean_log_name(d)}" for d in removed]
-            state["log"] = (state["log"] + "\n" + "\n".join(new_entries)).strip()
-            
-            if grid_locked():
-                new_on_waitlist = [clean_log_name(d) for d in added if drivers.index(d) >= grid_capacity]
-                if ENABLE_WAITLIST_MSG and new_on_waitlist:
-                    names_str = ", ".join(new_on_waitlist)
-                    txt = WAITLIST_TEXT_SINGLE if len(new_on_waitlist) == 1 else WAITLIST_TEXT_MULTI
-                    waitlist_msg = pick_text(txt).format(driver_names=names_str)
-
-                moved_up_drivers = []
-                if removed:
-                    for i, d in enumerate(drivers):
-                        if i < grid_capacity and d in old_drivers and old_drivers.index(d) >= grid_capacity:
-                            moved_up_drivers.append(clean_log_name(d))
+            state["log"] += "\n" + "\n".join([f"{ts} 🟢 {clean_name(d)}" for d in added] + [f"{ts} 🔴 {clean_name(d)}" for d in removed])
+            wd = get_now().weekday()
+            grid_locked = (wd == 6 and get_now().hour >= 18) or (wd == 0) or (wd == 1 and get_now().hour < 10)
+            if grid_locked:
+                wait_list = [clean_name(d) for d in added if drivers.index(d) >= grid_cap]
+                if wait_list:
+                    txt = WAITLIST_SINGLE if len(wait_list) == 1 else WAITLIST_MULTI
+                    discord_post(CHAN_NEWS, pick_text(txt).format(driver_names=", ".join(wait_list)))
                 
-                if moved_up_drivers:
-                    names_str = ", ".join(moved_up_drivers)
-                    txt = MOVED_UP_TEXT_SINGLE if len(moved_up_drivers) == 1 else MOVED_UP_TEXT_MULTI
-                    moved_up_msg = pick_text(txt).format(driver_names=names_str)
+                up = [clean_name(d) for i, d in enumerate(drivers) if i < grid_cap and d in old and old.index(d) >= grid_cap]
+                if up:
+                    txt = MOVED_UP_SINGLE if len(up) == 1 else MOVED_UP_MULTI
+                    discord_post(CHAN_NEWS, pick_text(txt).format(driver_names=", ".join(up)))
 
-        if not force_send and state.get("hash") == current_hash: return "No change"
-
-        state.update({"event_id": event_id, "hash": current_hash, "drivers": drivers, "grids": grids})
-        save_state(state)
+        if state.get("hash") != current_hash:
+            state["log_msg_id"] = send_or_edit_log(state["log"], state.get("log_msg_id"), state)
+            state["hash"] = current_hash
+            save_state(state)
+            if MAKE_WEBHOOK_URL: requests.post(MAKE_WEBHOOK_URL, json={"status": "updated", "drivers": driver_count})
         
-        payload = {
-            "type": msg_type, "drivers": drivers, "grids": grids, "grid_locked": grid_locked(),
-            "log": state["log"], "grid_full_msg": grid_full_msg, "sunday_msg": sunday_msg,
-            "waitlist_msg": waitlist_msg, "moved_up_msg": moved_up_msg, "extra_grid_msg": extra_grid_msg, 
-            "timestamp": now_dt.isoformat()
-        }
-        requests.post(MAKE_WEBHOOK_URL, json=payload)
-        return f"Success: {msg_type} sent"
-    except Exception as e: return f"Error: {str(e)}"
+        return "OK"
+    except Exception as e: return str(e)
 
 @app.route('/')
 def home(): return run_check()
