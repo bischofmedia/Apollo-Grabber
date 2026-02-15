@@ -234,7 +234,217 @@ def home():
             requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
 
         send_or_edit_log(count, grids, is_locked, config)
+        return "OK"import os
+import requests
+import json
+import re
+import math
+import datetime
+import pytz
+import time
+import random
+import threading
+from flask import Flask, request
+
+# ---------- GLOBAL ----------
+APOLLO_BOT_ID = "475744554910351370"
+LOG_FILE = "event_log.txt"
+BERLIN_TZ = pytz.timezone("Europe/Berlin")
+LOG_LOCK = threading.Lock()
+
+app = Flask(__name__)
+
+# ---------- CONFIG ----------
+def safe_int(val, default):
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+def get_config():
+    env = os.environ
+    return {
+        "DRIVERS_PER_GRID": safe_int(env.get("DRIVERS_PER_GRID"), 15),
+        "MAX_GRIDS": safe_int(env.get("MAX_GRIDS"), 4),
+        "EXTRA_THRESHOLD": safe_int(env.get("EXTRA_GRID_THRESHOLD"), 10),
+        "MIN_GRIDS_NEWS": safe_int(env.get("SET_MIN_GRIDS_MSG"), 2),
+
+        "SW_EXTRA": env.get("SET_MSG_EXTRA_GRID_TEXT") == "1",
+        "SW_FULL": env.get("SET_MSG_GRID_FULL_TEXT") == "1",
+        "SW_MOVE": env.get("SET_MSG_MOVED_UP_TEXT") == "1",
+        "SW_SUNDAY": env.get("ENABLE_SUNDAY_MSG") == "1",
+        "SW_WAIT": env.get("ENABLE_WAITLIST_MSG") == "1",
+        "ENABLE_EXTRA_LOGIC": env.get("ENABLE_EXTRA_GRID") == "1",
+
+        "CHAN_NEWS": env.get("CHAN_NEWS", ""),
+        "CHAN_CODES": env.get("CHAN_CODES", ""),
+        "CHAN_APOLLO": env.get("CHAN_APOLLO", ""),
+        "CHAN_LOG": env.get("CHAN_LOG", ""),
+
+        "DISCORD_TOKEN_APOLLOGRABBER": env.get("DISCORD_TOKEN_APOLLOGRABBER", ""),
+        "DISCORD_TOKEN_LOBBYCODEGRABBER": env.get("DISCORD_TOKEN_LOBBYCODEGRABBER", ""),
+
+        "MAKE_WEBHOOK_URL": env.get("MAKE_WEBHOOK_URL", ""),
+        "REGISTRATION_END_TIME": env.get("REGISTRATION_END_TIME", ""),
+
+        "SET_MANUAL_LOG_ID": env.get("SET_MANUAL_LOG_ID"),
+        "MSG_LOBBYCODES": env.get("MSG_LOBBYCODES", "")
+    }
+
+# ---------- HELPERS ----------
+def get_now():
+    return datetime.datetime.now(BERLIN_TZ)
+
+def format_ts_short(dt):
+    return dt.strftime("%d.%m %H:%M")
+
+def clean_for_log(name):
+    return re.sub(r"[>\\]", "", name).strip()
+
+def raw_for_make(name):
+    return name.replace(">>>", "").replace(">", "").strip()
+
+def safe_request(method, url, **kwargs):
+    try:
+        res = requests.request(method, url, timeout=6, **kwargs)
+        if not res.ok:
+            print("HTTP ERROR:", res.status_code, url)
+            return None
+        return res
+    except requests.RequestException as e:
+        print("REQUEST ERROR:", e)
+        return None
+
+# ---------- LOGGING ----------
+def write_log(line):
+    with LOG_LOCK:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+def read_log():
+    with LOG_LOCK:
+        if not os.path.exists(LOG_FILE):
+            return []
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip()]
+
+# ---------- DISCORD ----------
+def send_news(config, key, **fmt):
+    msg = os.environ.get(key, "")
+    if not msg:
+        return
+
+    try:
+        msg = msg.format(**fmt)
+    except:
+        pass
+
+    url = f"https://discord.com/api/v10/channels/{config['CHAN_NEWS']}/messages"
+    safe_request(
+        "POST",
+        url,
+        headers={"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"},
+        json={"content": msg},
+    )
+
+# ---------- DATA PARSE ----------
+def extract_data(embed):
+    drivers = []
+    for f in embed.get("fields", []):
+        name = f.get("name", "").lower()
+        if any(k in name for k in ("accepted", "confirmed", "anmeldung")):
+            for line in f.get("value", "").split("\n"):
+                cleaned = re.sub(r"^\d+[.)-]*\s*", "", line).strip()
+                if cleaned:
+                    drivers.append(cleaned)
+    return embed.get("title", "Event"), drivers
+
+# ---------- MAIN ----------
+@app.route("/")
+def home():
+    config = get_config()
+
+    try:
+        # Fetch Apollo message
+        url = f"https://discord.com/api/v10/channels/{config['CHAN_APOLLO']}/messages?limit=10"
+        res = safe_request(
+            "GET",
+            url,
+            headers={"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"},
+        )
+        if not res:
+            return "Discord unavailable"
+
+        data = res.json()
+
+        msg = next(
+            (
+                m
+                for m in data
+                if m.get("author", {}).get("id") == APOLLO_BOT_ID
+                and m.get("embeds")
+            ),
+            None,
+        )
+
+        if not msg:
+            return "Waiting for Apollo..."
+
+        title, drivers = extract_data(msg["embeds"][0])
+        drivers_clean = [clean_for_log(d) for d in drivers]
+
+        log = read_log()
+        known = set(
+            l.split(" ", 2)[-1]
+            for l in log
+            if "🟢" in l or "🟡" in l
+        )
+
+        now = get_now()
+
+        # detect changes
+        added = [d for d in drivers_clean if d not in known]
+        removed = [d for d in known if d not in drivers_clean]
+
+        cap = config["DRIVERS_PER_GRID"] * config["MAX_GRIDS"]
+
+        # write updates
+        for i, d in enumerate(drivers_clean):
+            if d in added:
+                icon = "🟢" if i < cap else "🟡"
+                write_log(f"{format_ts_short(now)} {icon} {d}")
+
+        for d in removed:
+            write_log(f"{format_ts_short(now)} 🔴 {d}")
+
+        # grids
+        count = len(drivers_clean)
+        grids = min(
+            math.ceil(count / config["DRIVERS_PER_GRID"]),
+            config["MAX_GRIDS"],
+        )
+
+        # webhook
+        if config["MAKE_WEBHOOK_URL"] and (added or removed):
+            payload = {
+                "type": "update",
+                "drivers": drivers_clean,
+                "count": count,
+                "grids": grids,
+                "timestamp": now.isoformat(),
+            }
+            safe_request("POST", config["MAKE_WEBHOOK_URL"], json=payload)
+
         return "OK"
+
+    except Exception as e:
+        return f"ERROR: {e}", 500
+
+
+# ---------- RUN ----------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=safe_int(os.environ.get("PORT"), 5000))
+
     except Exception as e: return f"Error: {str(e)}", 500
 
 def send_or_edit_log(count, grids, is_locked, config):
