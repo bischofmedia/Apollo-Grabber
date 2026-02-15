@@ -1,26 +1,11 @@
 import os, requests, json, re, math, datetime, pytz, time, random
 from flask import Flask, request
 
-# --- KONFIGURATION & ABSOLUTE URL-REINIGUNG ---
+# --- KONFIGURATION ---
 def get_config():
-    # Diese Funktion lässt NUR das durch, was für eine URL/Token erlaubt ist
-    def safe_str(val):
-        if not val: return ""
-        # Entfernt ALLES außer Alphanumerik und ein paar Sonderzeichen für URLs/Tokens
-        return re.sub(r'[^a-zA-Z0-9.\-_:/?=]', '', str(val)).strip()
-    
-    # Für reine IDs (Channel-IDs)
-    def only_digits(val):
-        return re.sub(r'[^0-9]', '', str(val)).strip()
-
     conf = {k: os.environ.get(k, "") for k in os.environ}
     return {
         **conf,
-        "CHAN_APOLLO": only_digits(conf.get("CHAN_APOLLO")),
-        "CHAN_LOG": only_digits(conf.get("CHAN_LOG")),
-        "CHAN_NEWS": only_digits(conf.get("CHAN_NEWS")),
-        "CHAN_CODES": only_digits(conf.get("CHAN_CODES")),
-        "MAKE_WEBHOOK_URL": safe_str(conf.get("MAKE_WEBHOOK_URL")),
         "DRIVERS_PER_GRID": int(conf.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(conf.get("MAX_GRIDS", 4)),
         "EXTRA_THRESHOLD": int(conf.get("EXTRA_GRID_THRESHOLD", 10)),
@@ -66,12 +51,9 @@ def send_combined_news(config, key_de, key_en, test_mode=False, **kwargs):
     text = f"📢 **NEWS-POST:**\n{msg_de}" + (f"\n\n{msg_en}" if msg_en else "")
     if test_mode: return text
     
-    chan = config.get("CHAN_NEWS")
-    token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
-    if chan and token:
-        url = f"https://discord.com/api/v10/channels/{chan}/messages"
-        h = {"Authorization": f"Bot {token.strip()}"}
-        requests.post(url, headers=h, json={"content": text})
+    url = f"https://discord.com/api/v10/channels/{config['CHAN_NEWS']}/messages"
+    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
+    requests.post(url, headers=h, json={"content": text})
     return text
 
 def write_to_persistent_log(line):
@@ -84,13 +66,10 @@ def read_persistent_log():
 
 def restore_log_from_discord(config):
     if os.path.exists(LOG_FILE): return
-    token = config.get('DISCORD_TOKEN_APOLLOGRABBER')
-    channel = config.get('CHAN_LOG')
-    if not token or not channel: return
-    h = {"Authorization": f"Bot {token.strip()}"}
+    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
     target_id = config.get('SET_MANUAL_LOG_ID')
-    url = f"https://discord.com/api/v10/channels/{channel}/messages"
-    if target_id: url += f"/{target_id.strip()}"
+    url = f"https://discord.com/api/v10/channels/{config['CHAN_LOG']}/messages"
+    if target_id: url += f"/{target_id}"
     else: url += "?limit=10"
     try:
         res = requests.get(url, headers=h, timeout=5)
@@ -106,11 +85,8 @@ def restore_log_from_discord(config):
     except: pass
 
 def lobby_cleanup(config):
-    token = config.get("DISCORD_TOKEN_LOBBYCODEGRABBER")
-    channel = config.get("CHAN_CODES")
-    if not token or not channel: return
-    h = {"Authorization": f"Bot {token.strip()}"}
-    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){channel}/messages"
+    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_LOBBYCODEGRABBER']}"}
+    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_CODES']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
     if res.status_code == 200:
         for m in res.json():
@@ -140,16 +116,14 @@ def reconstruct_drivers_from_log(lines=None):
             if name in current: current.remove(name)
     return current
 
-# --- SIMULATION (V79 - ABSOLUT VOLLSTÄNDIG) ---
+# --- TEST-LOGIK ---
 def run_simulation(config):
-    report = ["<html><body style='font-family:sans-serif; padding:20px;'>"]
-    report.append("<h1>System-Simulation V79</h1>")
-    
+    report = ["<html><body style='font-family:sans-serif; padding:20px;'><h1>System-Simulation V80</h1>"]
     dummy_now = get_now()
     fake_log = [f"{format_ts_short(dummy_now)} ✨ Simulation Start", f"{format_ts_short(dummy_now)} 🟢 Test_Fahrer_1"]
     drivers = ["Test_Fahrer_1", "Test_Fahrer_2"]
 
-    report.append("<h3>Make.com VOLLSTÄNDIGER Payload:</h3>")
+    report.append("<h3>Vollständiger Make.com Payload:</h3>")
     full_payload = {
         "type": "update",
         "driver_count": len(drivers),
@@ -170,20 +144,10 @@ def home():
 
     try:
         restore_log_from_discord(config)
-        token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
-        chan_apollo = config.get("CHAN_APOLLO")
-        if not token or not chan_apollo: return "Config Error", 500
-
-        # Hier erzwingen wir saubere Strings für Requests
-        clean_token = str(token).strip()
-        clean_chan = str(chan_apollo).strip()
-        
-        h = {"Authorization": f"Bot {clean_token}"}
-        url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){clean_chan}/messages?limit=10"
-        
+        h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
+        url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_APOLLO']}/messages?limit=10"
         res = requests.get(url, headers=h)
-        if res.status_code != 200: return f"Discord API Error: {res.status_code}", 500
-            
+        
         apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
         if not apollo_msg: return "Warte auf Apollo..."
 
@@ -191,7 +155,6 @@ def home():
         now = get_now()
         grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
         
-        # Lock Prüfung
         is_locked = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0)
         if not is_locked and now.weekday() == 0 and config.get('REGISTRATION_END_TIME'):
             try:
@@ -264,10 +227,8 @@ def home():
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
             payload = {
                 "type": "event_reset" if is_new else "update",
-                "driver_count": count, 
-                "drivers": [raw_for_make(d) for d in apollo_drivers],
-                "grids": grids, 
-                "log_history": "\n".join(read_persistent_log()),
+                "driver_count": count, "drivers": [raw_for_make(d) for d in apollo_drivers],
+                "grids": grids, "log_history": "\n".join(read_persistent_log()),
                 "timestamp": now.isoformat()
             }
             requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
@@ -277,10 +238,7 @@ def home():
     except Exception as e: return f"Error: {str(e)}", 500
 
 def send_or_edit_log(count, grids, is_locked, config):
-    token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
-    channel = config.get("CHAN_LOG")
-    if not token or not channel: return
-    h = {"Authorization": f"Bot {str(token).strip()}", "Content-Type": "application/json"}
+    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}", "Content-Type": "application/json"}
     ic = "🔒" if is_locked else "🟢"
     st = "Grids gesperrt / Locked" if is_locked else "Anmeldung geöffnet / Open"
     log_text = "\n".join(read_persistent_log()[-15:])
@@ -289,8 +247,8 @@ def send_or_edit_log(count, grids, is_locked, config):
                  f"```\n{log_text or 'Initialisiere...'}```\n"
                  f"*Stand: {format_ts_short(get_now())}*\n\n**Legende:**\n{legend}")
     tid = config.get('SET_MANUAL_LOG_ID')
-    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){str(channel).strip()}/messages"
-    if tid: requests.patch(f"{url}/{str(tid).strip()}", headers=h, json={"content": formatted})
+    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_LOG']}/messages"
+    if tid: requests.patch(f"{url}/{tid}", headers=h, json={"content": formatted})
     else: requests.post(url, headers=h, json={"content": formatted})
 
 if __name__ == "__main__":
