@@ -9,14 +9,10 @@ def get_config():
         "DRIVERS_PER_GRID": int(conf.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(conf.get("MAX_GRIDS", 4)),
         "EXTRA_THRESHOLD": int(conf.get("EXTRA_GRID_THRESHOLD", 10)),
-        "MIN_GRIDS_NEWS": int(conf.get("SET_MIN_GRIDS_MSG", 2)),
-        # Die Schalter (Booleans)
-        "SW_EXTRA": conf.get("SET_MSG_EXTRA_GRID_TEXT") == "1",
-        "SW_FULL": conf.get("SET_MSG_GRID_FULL_TEXT") == "1",
-        "SW_MOVE": conf.get("SET_MSG_MOVED_UP_TEXT") == "1",
-        "SW_SUNDAY": conf.get("ENABLE_SUNDAY_MSG") == "1",
-        "SW_WAIT": conf.get("ENABLE_WAITLIST_MSG") == "1",
-        "ENABLE_EXTRA_LOGIC": conf.get("ENABLE_EXTRA_GRID") == "1"
+        "ENABLE_EXTRA": conf.get("ENABLE_EXTRA_GRID") == "1",
+        "ENABLE_SUNDAY": conf.get("ENABLE_SUNDAY_MSG") == "1",
+        "ENABLE_WAITLIST": conf.get("ENABLE_WAITLIST_MSG") == "1",
+        "MIN_GRIDS_NEWS": int(conf.get("SET_MIN_GRIDS_MSG", 2))
     }
 
 APOLLO_BOT_ID = "475744554910351370"
@@ -38,16 +34,13 @@ def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
 
 def get_random_msg(key, **kwargs):
     raw = os.environ.get(key, "")
-    if not raw: return ""
+    if not raw: return None
     msg = random.choice(raw.split(";")).strip()
     try: return msg.format(**kwargs)
     except: return msg
 
-def send_combined_news(config, key_de, key_en, **kwargs):
-    msg_de = get_random_msg(key_de, **kwargs)
-    msg_en = get_random_msg(key_en, **kwargs)
-    if not msg_de: return
-    text = msg_de + (f"\n\n{msg_en}" if msg_en else "")
+def send_news(config, text):
+    if not config["CHAN_NEWS"] or not text: return
     url = f"https://discord.com/api/v10/channels/{config['CHAN_NEWS']}/messages"
     h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
     requests.post(url, headers=h, json={"content": text})
@@ -127,15 +120,6 @@ def home():
         now = get_now()
         grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
         
-        # Lock Prüfung
-        is_locked = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0)
-        if not is_locked and now.weekday() == 0 and config['REG_END_TIME']:
-            try:
-                hl, ml = map(int, config['REG_END_TIME'].split(":"))
-                if now >= now.replace(hour=hl, minute=ml, second=0, microsecond=0): is_locked = True
-            except: pass
-        if now.weekday() == 1 and now.hour < 10: is_locked = True
-
         log_lines = read_persistent_log()
         logged_drivers = reconstruct_drivers_from_log()
         is_new = not log_lines or (event_title not in log_lines[0] and "✨" in log_lines[0])
@@ -153,22 +137,16 @@ def home():
         else:
             if log_lines and "⚡" not in log_lines[-1]: write_to_persistent_log(f"{format_ts_short(now)} ⚡ Systemstart")
             
-            # Warteliste
-            waitlist_names = []
             for d in added:
                 idx = apollo_drivers.index(d)
                 is_wl = idx >= grid_cap
                 write_to_persistent_log(f"{format_ts_short(now)} {'🟡' if is_wl else '🟢'} {clean_for_log(d)}{' (Waitlist)' if is_wl else ''}")
-                if is_wl: waitlist_names.append(clean_for_log(d))
+                if config['ENABLE_WAITLIST'] and is_wl:
+                    send_news(config, get_random_msg("MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d)))
             
-            if config['SW_WAIT'] and waitlist_names:
-                k = "MSG_WAITLIST_MULTI" if len(waitlist_names) > 1 else "MSG_WAITLIST_SINGLE"
-                send_combined_news(config, k, k+"_EN", driver_names=", ".join(waitlist_names))
-            
-            for d_name in removed: write_to_persistent_log(f"{format_ts_short(now)} 🔴 {d_name}")
+            for d_name in removed:
+                write_to_persistent_log(f"{format_ts_short(now)} 🔴 {d_name}")
 
-            # Nachrücker
-            moved_up = []
             for d in apollo_drivers:
                 d_clean = clean_for_log(d)
                 if d_clean in logged_drivers:
@@ -176,29 +154,24 @@ def home():
                     last_entry = next((l for l in reversed(log_lines) if d_clean in l), "")
                     if idx_now < grid_cap and "🟡" in last_entry:
                         write_to_persistent_log(f"{format_ts_short(now)} 🟢 {d_clean} (Nachgerückt)")
-                        moved_up.append(d_clean)
-            
-            if config['SW_MOVE'] and moved_up:
-                k = "MSG_MOVED_UP_MULTI" if len(moved_up) > 1 else "MSG_MOVED_UP_SINGLE"
-                send_combined_news(config, k, k+"_EN", driver_names=", ".join(moved_up))
+                        send_news(config, get_random_msg("MSG_MOVED_UP_SINGLE", driver_names=d_clean))
 
-        # Grid Logik
         count = len(apollo_drivers)
         grids = min(math.ceil(count/config['DRIVERS_PER_GRID']), config['MAX_GRIDS'])
         
-        if config['ENABLE_EXTRA_LOGIC'] and count > grid_cap + config['EXTRA_THRESHOLD']:
+        if config['ENABLE_EXTRA'] and count > grid_cap + config['EXTRA_THRESHOLD']:
             grids += 1
-            if config['SW_EXTRA'] and not any("🏗️" in l for l in log_lines[-5:]):
-                send_combined_news(config, "MSG_EXTRA_GRID_TEXT", "MSG_EXTRA_GRID_TEXT_EN")
+            if not any("🏗️" in l for l in log_lines[-5:]):
+                send_news(config, get_random_msg("MSG_EXTRA_GRID_TEXT"))
 
-        if config['SW_FULL'] and count > 0 and count % config['DRIVERS_PER_GRID'] == 0:
+        if count > 0 and count % config['DRIVERS_PER_GRID'] == 0:
             cur = count // config['DRIVERS_PER_GRID']
             if cur >= config['MIN_GRIDS_NEWS'] and not any(f"Grids: `{cur}`" in l for l in log_lines[-3:]):
-                send_combined_news(config, "MSG_GRID_FULL_TEXT", "MSG_GRID_FULL_TEXT_EN", full_grids=cur)
+                send_news(config, get_random_msg("MSG_GRID_FULL_TEXT", full_grids=cur))
 
-        if config['SW_SUNDAY'] and now.weekday() == 6 and now.hour == 18 and now.minute < 10:
+        if config['ENABLE_SUNDAY'] and now.weekday() == 6 and now.hour == 18 and now.minute < 5:
             free = (grids * config['DRIVERS_PER_GRID']) - count
-            send_combined_news(config, "MSG_SUNDAY_TEXT", "MSG_SUNDAY_TEXT_EN", driver_count=count, grids=grids, free_slots=max(0, free))
+            send_news(config, get_random_msg("MSG_SUNDAY_TEXT", driver_count=count, grids=grids, free_slots=max(0, free)))
 
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
             payload = {
@@ -209,14 +182,12 @@ def home():
             }
             requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
 
-        send_or_edit_log(count, grids, is_locked, config)
+        send_or_edit_log(count, grids, config)
         return "OK"
     except Exception as e: return f"Error: {str(e)}", 500
 
-def send_or_edit_log(count, grids, is_locked, config):
+def send_or_edit_log(count, grids, config):
     h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}", "Content-Type": "application/json"}
-    ic = "🔒" if is_locked else "🟢"
-    st = "Grids gesperrt / Locked" if is_locked else "Anmeldung geöffnet / Open"
     full_log = read_persistent_log()
     log_text = ""
     for entry in reversed(full_log):
@@ -225,7 +196,7 @@ def send_or_edit_log(count, grids, is_locked, config):
             break
         log_text = entry + "\n" + log_text
     legend = "🟢 Angemeldet / Registered\n🟡 Warteliste / Waitlist\n🔴 Abgemeldet / Withdrawn"
-    formatted = (f"{ic} **{st}**\nFahrer: `{count}` | Grids: `{grids}`\n\n"
+    formatted = (f"**Anmeldung / Registration**\nFahrer: `{count}` | Grids: `{grids}`\n\n"
                  f"```\n{log_text or 'Initialisiere...'}```\n"
                  f"*Stand: {format_ts_short(get_now())}*\n\n**Legende:**\n{legend}")
     tid = config.get('SET_MANUAL_LOG_ID')
