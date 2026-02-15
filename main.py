@@ -1,21 +1,21 @@
 import os, requests, json, re, math, datetime, pytz, time, random
 from flask import Flask, request
 
-# --- KONFIGURATION MIT AGGRESSIVER REINIGUNG ---
+# --- KONFIGURATION & URL-ABSICHERUNG ---
 def get_config():
-    # Bereinigt IDs von unsichtbaren Zeichen, Klammern oder Markdown-Resten
-    def clean(val):
+    def clean_id(val):
         if not val: return ""
-        return re.sub(r'[^a-zA-Z0-9.\-_:/?=]', '', str(val)).strip()
+        # Entfernt alles außer Ziffern (bereinigt Markdown-Reste wie [123](123))
+        return re.sub(r'[^0-9]', '', str(val)).strip()
 
     conf = {k: os.environ.get(k, "") for k in os.environ}
     return {
         **conf,
-        "CHAN_APOLLO": clean(conf.get("CHAN_APOLLO")),
-        "CHAN_LOG": clean(conf.get("CHAN_LOG")),
-        "CHAN_NEWS": clean(clean(conf.get("CHAN_NEWS"))),
-        "CHAN_CODES": clean(conf.get("CHAN_CODES")),
-        "MAKE_WEBHOOK_URL": conf.get("MAKE_WEBHOOK_URL", "").strip(), 
+        "CHAN_APOLLO": clean_id(conf.get("CHAN_APOLLO")),
+        "CHAN_LOG": clean_id(conf.get("CHAN_LOG")),
+        "CHAN_NEWS": clean_id(conf.get("CHAN_NEWS")),
+        "CHAN_CODES": clean_id(conf.get("CHAN_CODES")),
+        "MAKE_WEBHOOK_URL": str(conf.get("MAKE_WEBHOOK_URL", "")).strip(),
         "DRIVERS_PER_GRID": int(conf.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(conf.get("MAX_GRIDS", 4)),
         "EXTRA_THRESHOLD": int(conf.get("EXTRA_GRID_THRESHOLD", 10)),
@@ -28,6 +28,7 @@ def get_config():
         "ENABLE_EXTRA_LOGIC": conf.get("ENABLE_EXTRA_GRID") == "1"
     }
 
+# Fest hinterlegte Bot-ID zur Identifikation der Apollo-Nachricht
 APOLLO_BOT_ID = "475744554910351370"
 LOG_FILE = "event_log.txt"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
@@ -133,17 +134,20 @@ def reconstruct_drivers_from_log(lines=None):
             if name in current: current.remove(name)
     return current
 
-# --- TEST-LOGIK (V75 - VOLLSTÄNDIG) ---
+# --- SIMULATION (V77 - URL-PANZER & VOLL-PAYLOAD) ---
 def run_simulation(config):
     report = ["<html><body style='font-family:sans-serif; padding:20px;'>"]
-    report.append("<h1>System-Simulation V75</h1>")
+    report.append("<h1>System-Simulation V77</h1>")
+    
+    # URL Kontrolle
+    report.append("<h3>URL Kontrolle:</h3>")
+    report.append(f"Basispfad: <code>[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_APOLLO']}/messages</code>")
     
     dummy_now = get_now()
-    fake_log = [f"{format_ts_short(dummy_now)} ✨ Event gestartet (Simulation GP)", f"{format_ts_short(dummy_now)} 🟢 Test_Fahrer_1"]
-    drivers = ["Test_Fahrer_1", "Test_Fahrer_2"]
+    fake_log = [f"{format_ts_short(dummy_now)} ✨ Simulation Start", f"{format_ts_short(dummy_now)} 🟢 Fahrer_1"]
+    drivers = ["Fahrer_1", "Fahrer_2"]
 
-    report.append("<h3>Simulation: Make.com Vollständiger Payload</h3>")
-    # Hier ist ALLES drin: type, driver_count, drivers, grids, log_history
+    report.append("<h3>Make.com Payload (Vollständig):</h3>")
     full_payload = {
         "type": "update",
         "driver_count": len(drivers),
@@ -152,7 +156,7 @@ def run_simulation(config):
         "log_history": "\n".join(fake_log),
         "timestamp": dummy_now.isoformat()
     }
-    report.append(f"<pre style='background:#333; color:#0f0; padding:15px; overflow:auto;'>{json.dumps(full_payload, indent=4)}</pre>")
+    report.append(f"<pre style='background:#222; color:#0f0; padding:15px;'>{json.dumps(full_payload, indent=4)}</pre>")
     
     report.append("</body></html>")
     return "".join(report)
@@ -167,20 +171,23 @@ def home():
         restore_log_from_discord(config)
         token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
         chan_apollo = config.get("CHAN_APOLLO")
-        if not token or not chan_apollo: return "Missing Config", 500
-
-        h = {"Authorization": f"Bot {token}"}
-        url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){chan_apollo}/messages?limit=10"
-        res = requests.get(url, headers=h)
         
+        # URL hier absolut sauber zusammenbauen
+        h = {"Authorization": f"Bot {token}"}
+        api_url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){chan_apollo}/messages?limit=10"
+        
+        res = requests.get(api_url, headers=h)
+        if res.status_code != 200:
+            return f"Discord API Error: {res.status_code}", 500
+            
         apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "No Apollo Msg"
+        if not apollo_msg: return "Warte auf Apollo..."
 
         event_title, apollo_drivers = extract_data(apollo_msg["embeds"][0])
         now = get_now()
         grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
         
-        # Lock Prüfung
+        # Lock Prüfung (20:45)
         is_locked = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0)
         if not is_locked and now.weekday() == 0 and config.get('REGISTRATION_END_TIME'):
             try:
@@ -251,7 +258,6 @@ def home():
             send_combined_news(config, "MSG_SUNDAY_TEXT", "MSG_SUNDAY_TEXT_EN", driver_count=count, grids=grids, free_slots=max(0, free))
 
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
-            # PAYLOAD FIX: Hier sind alle Felder wieder aktiv
             payload = {
                 "type": "event_reset" if is_new else "update",
                 "driver_count": count, 
@@ -273,7 +279,7 @@ def send_or_edit_log(count, grids, is_locked, config):
     h = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     ic = "🔒" if is_locked else "🟢"
     st = "Grids gesperrt / Locked" if is_locked else "Anmeldung geöffnet / Open"
-    log_text = "\n".join(read_persistent_log()[-15:]) # Letzte 15 Zeilen
+    log_text = "\n".join(read_persistent_log()[-15:])
     legend = "🟢 Angemeldet / Registered\n🟡 Warteliste / Waitlist\n🔴 Abgemeldet / Withdrawn"
     formatted = (f"{ic} **{st}**\nFahrer: `{count}` | Grids: `{grids}`\n\n"
                  f"```\n{log_text or 'Initialisiere...'}```\n"
