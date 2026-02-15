@@ -1,9 +1,9 @@
-import os, requests, json, re, math, datetime, pytz, threading
+import os, requests, json, re, math, datetime, pytz, threading, time, random
 from flask import Flask, request
 
-# --- KONFIGURATION (Angepasst an deine aktuellen Render-Variablen) ---
+# ---------- CONFIG & URL-SCHUTZ ----------
 def get_env_config():
-    # Schützt vor dem "Connection Adapter" Fehler durch radikale ID-Reinigung
+    # Radikale Reinigung der IDs, um den "Connection Adapter"-Fehler zu verhindern
     def c_id(v): return re.sub(r'[^0-9]', '', str(v)) if v else ""
     
     e = os.environ
@@ -18,10 +18,16 @@ def get_env_config():
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)),
         "EXTRA_THRESH": int(e.get("EXTRA_GRID_THRESHOLD", 10)),
+        "REG_END_TIME": e.get("REGISTRATION_END_TIME", "20:45").strip(),
+        "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
+        # Schalter
+        "SW_EXTRA": e.get("SET_MSG_EXTRA_GRID_TEXT") == "1",
+        "SW_FULL": e.get("SET_MSG_GRID_FULL_TEXT") == "1",
+        "SW_MOVE": e.get("SET_MSG_MOVED_UP_TEXT") == "1",
+        "SW_SUN": e.get("ENABLE_SUNDAY_MSG") == "1",
+        "SW_WAIT": e.get("ENABLE_WAITLIST_MSG") == "1",
         "ENABLE_EXTRA": e.get("ENABLE_EXTRA_GRID") == "1",
-        "MSG_LOBBY": e.get("MSG_LOBBYCODES", "Lobby offen!"),
-        "REG_END_TIME": e.get("REGISTRATION_END_TIME", "").strip(),
-        "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID"))
+        "MSG_LOBBY": e.get("MSG_LOBBYCODES", "")
     }
 
 APOLLO_BOT_ID = "475744554910351370"
@@ -32,7 +38,7 @@ LOG_LOCK = threading.Lock()
 
 app = Flask(__name__)
 
-# --- HELFER ---
+# ---------- HELFER ----------
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
 
 def format_ts_short(dt_obj):
@@ -43,6 +49,14 @@ def format_ts_short(dt_obj):
 
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
+
+def get_random_msg(key, **kwargs):
+    raw = os.environ.get(key, "")
+    if not raw: return ""
+    msgs = [m.strip() for m in raw.split(";") if m.strip()]
+    msg = random.choice(msgs) if msgs else raw
+    try: return msg.format(**kwargs)
+    except: return msg
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -59,114 +73,138 @@ def read_persistent_log():
     with open(LOG_FILE, "r", encoding="utf-8") as f:
         return [l.strip() for l in f if l.strip()]
 
-# --- MAIN ---
+# ---------- FEATURES ----------
+def lobby_cleanup(conf):
+    if not conf["TOKEN_LOBBY"] or not conf["CHAN_CODES"]: return
+    h = {"Authorization": f"Bot {conf['TOKEN_LOBBY']}"}
+    url = f"https://discord.com/api/v10/channels/{conf['CHAN_CODES']}/messages"
+    res = requests.get(f"{url}?limit=100", headers=h)
+    if res.ok:
+        for m in res.json():
+            requests.delete(f"{url}/{m['id']}", headers=h)
+            time.sleep(0.4)
+    if conf["MSG_LOBBY"]:
+        requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
+
+def send_combined_news(conf, key_base, **kwargs):
+    if not conf["CHAN_NEWS"]: return
+    msg_de = get_random_msg(key_base, **kwargs)
+    msg_en = get_random_msg(key_base + "_EN", **kwargs)
+    if not msg_de: return
+    full_text = msg_de + (f"\n\n{msg_en}" if msg_en else "")
+    h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
+    requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages", headers=h, json={"content": full_text})
+
+# ---------- MAIN ----------
 @app.route('/')
 def home():
     conf = get_env_config()
-    # Check ob die kritischsten Variablen da sind
-    if not conf["TOKEN_APOLLO"] or not conf["CHAN_APOLLO"]:
-        return "Config Error: Check Tokens/Channels", 500
+    if not conf["TOKEN_APOLLO"] or not conf["CHAN_APOLLO"]: return "Config Error", 500
 
     try:
-        # SICHERER URL-AUFRUF (Zusammenbau ohne f-string Risiko)
         api_url = "https://discord.com/api/v10/channels/" + conf["CHAN_APOLLO"] + "/messages?limit=10"
-        headers = {"Authorization": "Bot " + conf["TOKEN_APOLLO"]}
+        h_apollo = {"Authorization": "Bot " + conf["TOKEN_APOLLO"]}
         
-        res = requests.get(api_url, headers=headers, timeout=10)
-        if not res.ok: return f"Discord API Error: {res.status_code}", 500
+        res = requests.get(api_url, headers=h_apollo, timeout=10)
+        if not res.ok: return f"Discord Error: {res.status_code}", 500
         
-        data = res.json()
-        apollo_msg = next((m for m in data if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "Kein Apollo-Post gefunden."
+        apollo_msg = next((m for m in res.json() if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID and m.get("embeds")), None)
+        if not apollo_msg: return "Waiting for Apollo..."
 
-        # Daten extrahieren
         embed = apollo_msg["embeds"][0]
-        event_title = embed.get("title", "Event")
-        drivers = []
-        for field in embed.get("fields", []):
-            if any(kw in field.get("name", "").lower() for kw in ["accepted", "confirmed", "anmeldung"]):
-                for line in field.get("value", "").split("\n"):
+        event_title, drivers = embed.get("title", "Event"), []
+        for f in embed.get("fields", []):
+            if any(k in f.get("name", "").lower() for k in ["accepted", "confirmed", "anmeldung"]):
+                for line in f.get("value", "").split("\n"):
                     c = re.sub(r"^\d+[\s.)-]*", "", line).strip()
                     if c: drivers.append(c)
 
-        state = load_state()
-        now = get_now()
+        state, now = load_state(), get_now()
         grid_cap = conf["MAX_GRIDS"] * conf["DRIVERS_PER_GRID"]
-        
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
         
-        # LOG HANDLING
+        # Lock Prüfung (20:45)
+        is_locked = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0)
+        if not is_locked and now.weekday() == 0:
+            try:
+                hl, ml = map(int, conf["REG_END_TIME"].split(":"))
+                if now >= now.replace(hour=hl, minute=ml, second=0, microsecond=0): is_locked = True
+            except: pass
+
+        # Event Reset / Init
         if is_new or not os.path.exists(LOG_FILE):
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(f"{format_ts_short(now)} ✨ Event: {event_title}\n")
+            lobby_cleanup(conf)
             state = {"event_id": apollo_msg["id"], "drivers": [], "last_make_sync": None}
-            # Hier könnte der Lobby-Cleanup rein, falls gewünscht
-        
+
         old_drivers = state.get("drivers", [])
         added = [d for d in drivers if d not in old_drivers]
         removed = [d for d in old_drivers if d not in drivers]
+        moved_up = [d for d in drivers if d in old_drivers and drivers.index(d) < grid_cap and old_drivers.index(d) >= grid_cap]
 
-        if added or removed:
+        if added or removed or moved_up:
             with LOG_LOCK:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for d in added:
                         idx = drivers.index(d)
-                        icon = "🟢" if idx < grid_cap else "🟡"
-                        f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{'' if idx < grid_cap else ' (Waitlist)'}\n")
+                        icon = "🟡" if idx >= grid_cap else "🟢"
+                        f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= grid_cap else ''}\n")
+                    for d in moved_up:
+                        f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)} (Nachgerückt)\n")
                     for d in removed:
                         f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
-        # GRID BERECHNUNG
-        driver_count = len(drivers)
-        grids = min(math.ceil(driver_count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
-        if conf["ENABLE_EXTRA"] and driver_count > grid_cap + conf["EXTRA_THRESH"]:
-            grids += 1
+            # News Trigger
+            if conf["SW_WAIT"] and any(drivers.index(d) >= grid_cap for d in added):
+                wl_names = [clean_for_log(d) for d in added if drivers.index(d) >= grid_cap]
+                k = "MSG_WAITLIST_MULTI" if len(wl_names) > 1 else "MSG_WAITLIST_SINGLE"
+                send_combined_news(conf, k, driver_names=", ".join(wl_names))
 
-        # WEBHOOK AN MAKE
+            if conf["SW_MOVE"] and moved_up:
+                k = "MSG_MOVED_UP_MULTI" if len(moved_up) > 1 else "MSG_MOVED_UP_SINGLE"
+                send_combined_news(conf, k, driver_names=", ".join([clean_for_log(d) for d in moved_up]))
+
+        # Grid-Logik & Webhook
+        count = len(drivers)
+        grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
+        if conf["ENABLE_EXTRA"] and count > grid_cap + conf["EXTRA_THRESH"]:
+            grids += 1
+            if conf["SW_EXTRA"] and not any("🏗️" in l for l in read_persistent_log()[-5:]):
+                send_combined_news(conf, "MSG_EXTRA_GRID_TEXT")
+
         if conf["MAKE_WEBHOOK"] and (added or removed or is_new):
             payload = {
                 "type": "event_reset" if is_new else "update",
-                "driver_count": driver_count,
-                "drivers": [raw_for_make(d) for d in drivers],
-                "grids": grids,
-                "log_history": "\n".join(read_persistent_log()),
+                "driver_count": count, "drivers": [raw_for_make(d) for d in drivers],
+                "grids": grids, "log_history": "\n".join(read_persistent_log()),
                 "timestamp": now.isoformat()
             }
             requests.post(conf["MAKE_WEBHOOK"], json=payload)
             state["last_make_sync"] = now.isoformat()
 
-        # DISCORD LOG UPDATE
-        send_or_edit_discord_log(conf, state, driver_count, grids)
-        
+        send_or_edit_log(conf, state, count, grids, is_locked)
         state["drivers"] = drivers
         save_state(state)
-        return "OK - V85"
+        return "OK - V86"
+    except Exception as e: return f"Fehler: {str(e)}", 500
 
-    except Exception as e:
-        return f"Fehler: {str(e)}", 500
-
-def send_or_edit_discord_log(conf, state, count, grids):
+def send_or_edit_log(conf, state, count, grids, is_locked):
     if not conf["CHAN_LOG"]: return
+    log_text = "\n".join(read_persistent_log()[-15:])
+    status = "Anmeldung geöffnet / Open" if not is_locked else "Grids gesperrt / Locked"
+    icon = "🔒" if is_locked else "🟢"
+    sync_ts = format_ts_short(datetime.datetime.fromisoformat(state["last_make_sync"]).astimezone(BERLIN_TZ)) if state.get("last_make_sync") else "--"
     
-    log_entries = read_persistent_log()
-    log_text = "\n".join(log_entries[-15:]) # Letzte 15 Zeilen für Discord
-    
-    sync_ts = "--"
-    if state.get("last_make_sync"):
-        dt = datetime.datetime.fromisoformat(state["last_make_sync"])
-        sync_ts = format_ts_short(dt.astimezone(BERLIN_TZ))
-
-    content = (f"📊 **Event Status: {count} Fahrer / {grids} Grids**\n"
+    content = (f"{icon} **{status}**\nFahrer: `{count}` | Grids: `{grids}`\n\n"
                f"```\n{log_text}```\n"
-               f"*Letzter Sync: {sync_ts}*")
-
-    h = {"Authorization": "Bot " + conf["TOKEN_APOLLO"]}
-    msg_id = conf["MANUAL_LOG_ID"]
+               f"*Stand: {format_ts_short(get_now())}* | *Sync: {sync_ts}*\n\n"
+               f"**Legende:**\n🟢 Angemeldet\n🟡 Warteliste\n🔴 Abgemeldet")
     
-    if msg_id:
-        requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{msg_id}", headers=h, json={"content": content})
+    h = {"Authorization": "Bot " + conf["TOKEN_APOLLO"]}
+    mid = conf["MANUAL_LOG_ID"]
+    if mid: requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{mid}", headers=h, json={"content": content})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-   
