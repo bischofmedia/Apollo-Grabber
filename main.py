@@ -3,7 +3,7 @@ from flask import Flask, request
 
 # --- KONFIGURATION ---
 def get_config():
-    conf = {k: os.environ.get(k, "") for k in os.environ}
+    conf = {k: str(os.environ.get(k, "")).strip() for k in os.environ}
     return {
         **conf,
         "DRIVERS_PER_GRID": int(conf.get("DRIVERS_PER_GRID", 15)),
@@ -38,7 +38,9 @@ def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
 def get_random_msg(key, **kwargs):
     raw = os.environ.get(key, "")
     if not raw: return ""
-    msg = random.choice(raw.split(";")).strip()
+    msgs = [m.strip() for m in raw.split(";") if m.strip()]
+    if not msgs: return ""
+    msg = random.choice(msgs)
     try: return msg.format(**kwargs)
     except: return msg
 
@@ -49,9 +51,10 @@ def send_combined_news(config, key_de, key_en, test_mode=False, **kwargs):
     text = f"📢 **NEWS-POST:**\n{msg_de}" + (f"\n\n{msg_en}" if msg_en else "")
     if test_mode: return text
     
-    url = f"https://discord.com/api/v10/channels/{config['CHAN_NEWS']}/messages"
-    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
-    requests.post(url, headers=h, json={"content": text})
+    if config.get("CHAN_NEWS"):
+        url = f"https://discord.com/api/v10/channels/{config['CHAN_NEWS']}/messages"
+        h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
+        requests.post(url, headers=h, json={"content": text})
     return text
 
 def write_to_persistent_log(line):
@@ -64,11 +67,15 @@ def read_persistent_log():
 
 def restore_log_from_discord(config):
     if os.path.exists(LOG_FILE): return
-    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
-    url = f"https://discord.com/api/v10/channels/{config['CHAN_LOG']}/messages"
+    token = config.get('DISCORD_TOKEN_APOLLOGRABBER')
+    channel = config.get('CHAN_LOG')
+    if not token or not channel: return
+    
+    h = {"Authorization": f"Bot {token}"}
     target_id = config.get('SET_MANUAL_LOG_ID')
-    if target_id: url += f"/{target_id}"
-    else: url += "?limit=10"
+    if target_id: url = f"https://discord.com/api/v10/channels/{channel}/messages/{target_id}"
+    else: url = f"https://discord.com/api/v10/channels/{channel}/messages?limit=10"
+    
     try:
         res = requests.get(url, headers=h, timeout=5)
         if res.status_code == 200:
@@ -83,9 +90,11 @@ def restore_log_from_discord(config):
     except: pass
 
 def lobby_cleanup(config):
-    if not config["DISCORD_TOKEN_LOBBYCODEGRABBER"] or not config["CHAN_CODES"]: return
-    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_LOBBYCODEGRABBER']}"}
-    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_CODES']}/messages"
+    token = config.get("DISCORD_TOKEN_LOBBYCODEGRABBER")
+    channel = config.get("CHAN_CODES")
+    if not token or not channel: return
+    h = {"Authorization": f"Bot {token}"}
+    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){channel}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
     if res.status_code == 200:
         for m in res.json():
@@ -115,45 +124,37 @@ def reconstruct_drivers_from_log(lines=None):
             if name in current: current.remove(name)
     return current
 
-# --- TEST-LOGIK (V73 ERWEITERT) ---
+# --- TEST-LOGIK (V74) ---
 def run_simulation(config):
-    report = ["<html><body style='font-family:sans-serif; padding:20px;'>"]
-    report.append("<h1>System-Simulation V73</h1>")
+    report = ["<html><body style='font-family:sans-serif; padding:20px; line-height:1.6;'>"]
+    report.append("<h1 style='color:#333;'>System-Simulation V74</h1>")
+    
+    # 1. Variablen-Check
+    report.append("<h3>1. Konfigurations-Check (Render-Variablen)</h3>")
+    report.append("<table border='1' style='border-collapse:collapse; width:100%;'>")
+    report.append("<tr style='background:#eee;'><th>Variable</th><th>Wert</th><th>Status</th></tr>")
+    important_keys = ["DISCORD_TOKEN_APOLLOGRABBER", "CHAN_APOLLO", "CHAN_LOG", "CHAN_NEWS", "ENABLE_EXTRA_GRID", "SET_MSG_GRID_FULL_TEXT", "ENABLE_SUNDAY_MSG", "REGISTRATION_END_TIME"]
+    for k in important_keys:
+        val = config.get(k, "FEHLT")
+        color = "green" if val not in ["FEHLT", ""] else "red"
+        display_val = "Hinterlegt" if "TOKEN" in k and val != "FEHLT" else val
+        report.append(f"<tr><td>{k}</td><td>{display_val}</td><td style='color:{color}'>{'OK' if color=='green' else 'PRÜFEN'}</td></tr>")
+    report.append("</table>")
+
+    # 2. Simulationen
     grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
     dummy_now = get_now()
-    
-    report.append("<h3>1. Simulation: Event-Start & Warteliste</h3>")
-    fake_log = [f"{format_ts_short(dummy_now)} ✨ Event gestartet (Simulation GP)"]
-    drivers = [f"Fahrer_{i}" for i in range(1, grid_cap + 2)]
-    
-    waitlist_names = []
-    for idx, d in enumerate(drivers):
-        is_wl = idx >= grid_cap
-        fake_log.append(f"{format_ts_short(dummy_now)} {'🟡' if is_wl else '🟢'} {d}{' (Waitlist)' if is_wl else ''}")
-        if is_wl: waitlist_names.append(d)
-    
-    if waitlist_names:
-        news = send_combined_news(config, "MSG_WAITLIST_SINGLE", "MSG_WAITLIST_SINGLE_EN", test_mode=True, driver_names=", ".join(waitlist_names))
-        report.append(f"<div style='border-left:4px solid blue; padding-left:10px;'>{news.replace(chr(10), '<br>')}</div>")
-
     report.append("<h3>2. Simulation: Multi-Nachrücken</h3>")
-    fake_log.append(f"{format_ts_short(dummy_now)} 🔴 Fahrer_1")
-    fake_log.append(f"{format_ts_short(dummy_now)} 🔴 Fahrer_2")
-    moved_up = ["Fahrer_61", "Fahrer_62"]
+    moved_up = ["Test_Fahrer_A", "Test_Fahrer_B"]
     news_move = send_combined_news(config, "MSG_MOVED_UP_MULTI", "MSG_MOVED_UP_MULTI_EN", test_mode=True, driver_names=", ".join(moved_up))
-    report.append(f"<div style='border-left:4px solid green; padding-left:10px;'>{news_move.replace(chr(10), '<br>')}</div>")
+    report.append(f"<div style='border-left:4px solid green; background:#f9fff9; padding:10px;'>{news_move.replace(chr(10), '<br>')}</div>")
 
-    report.append("<h3>3. Simulation: Make.com Webhook Payload</h3>")
+    report.append("<h3>3. Simulation: Make.com Webhook JSON</h3>")
     fake_payload = {
-        "type": "update",
-        "driver_count": len(drivers) - 2 + len(moved_up),
-        "drivers": [f"Fahrer_{i}" for i in range(3, grid_cap + 3)],
-        "grids": min(math.ceil((len(drivers)-2)/config['DRIVERS_PER_GRID']), config['MAX_GRIDS']),
-        "log_history": "\n".join(fake_log),
+        "type": "update", "driver_count": 42, "grids": 3,
         "timestamp": dummy_now.isoformat()
     }
-    report.append(f"<pre style='background:#f4f4f4; padding:10px; border:1px solid #ccc;'>{json.dumps(fake_payload, indent=4)}</pre>")
-
+    report.append(f"<pre style='background:#333; color:#fff; padding:10px;'>{json.dumps(fake_payload, indent=4)}</pre>")
     report.append("</body></html>")
     return "".join(report)
 
@@ -161,15 +162,20 @@ def run_simulation(config):
 @app.route('/')
 def home():
     config = get_config()
-    if request.args.get('test') == '1':
-        return run_simulation(config)
+    if request.args.get('test') == '1': return run_simulation(config)
 
     try:
         restore_log_from_discord(config)
-        h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}"}
-        res = requests.get(f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_APOLLO']}/messages?limit=10", headers=h)
+        token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
+        chan_apollo = config.get("CHAN_APOLLO")
+        if not token or not chan_apollo: return "Config Missing", 500
+
+        h = {"Authorization": f"Bot {token}"}
+        url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){chan_apollo}/messages?limit=10"
+        res = requests.get(url, headers=h)
+        
         apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "Waiting..."
+        if not apollo_msg: return "Waiting for Apollo..."
 
         event_title, apollo_drivers = extract_data(apollo_msg["embeds"][0])
         now = get_now()
@@ -259,7 +265,10 @@ def home():
     except Exception as e: return f"Error: {str(e)}", 500
 
 def send_or_edit_log(count, grids, is_locked, config):
-    h = {"Authorization": f"Bot {config['DISCORD_TOKEN_APOLLOGRABBER']}", "Content-Type": "application/json"}
+    token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
+    channel = config.get("CHAN_LOG")
+    if not token or not channel: return
+    h = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     ic = "🔒" if is_locked else "🟢"
     st = "Grids gesperrt / Locked" if is_locked else "Anmeldung geöffnet / Open"
     full_log = read_persistent_log()
@@ -274,7 +283,7 @@ def send_or_edit_log(count, grids, is_locked, config):
                  f"```\n{log_text or 'Initialisiere...'}```\n"
                  f"*Stand: {format_ts_short(get_now())}*\n\n**Legende:**\n{legend}")
     tid = config.get('SET_MANUAL_LOG_ID')
-    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_LOG']}/messages"
+    url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){channel}/messages"
     if tid: requests.patch(f"{url}/{tid}", headers=h, json={"content": formatted})
     else: requests.post(url, headers=h, json={"content": formatted})
 
