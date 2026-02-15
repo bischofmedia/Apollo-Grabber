@@ -2,7 +2,8 @@ import os, requests, json, re, math, datetime, pytz, time
 from flask import Flask, request
 
 # --- KONFIGURATION ---
-def get_env_config():
+# Wir laden die Config einmal global, damit alle Funktionen darauf zugreifen können
+def get_config():
     return {
         "TOKEN_APOLLO": os.environ.get("DISCORD_TOKEN_APOLLOGRABBER"),
         "TOKEN_LOBBY": os.environ.get("DISCORD_TOKEN_LOBBYCODEGRABBER"),
@@ -10,16 +11,14 @@ def get_env_config():
         "CHAN_LOG": os.environ.get("CHAN_LOG"),
         "CHAN_CODES": os.environ.get("CHAN_CODES"),
         "MSG_LOBBY": os.environ.get("MSG_LOBBYCODES", "Willkommen im neuen Event!"),
-        "MAKE_WEBHOOK_URL": os.environ.get("MAKE_WEBHOOK_URL")
+        "MAKE_WEBHOOK_URL": os.environ.get("MAKE_WEBHOOK_URL"),
+        "DRIVERS_PER_GRID": int(os.environ.get("DRIVERS_PER_GRID", 15)),
+        "MAX_GRIDS": int(os.environ.get("MAX_GRIDS", 4)),
+        "REG_END_TIME": os.environ.get("REGISTRATION_END_TIME", "").strip(),
+        "SET_MANUAL_LOG_ID": os.environ.get("SET_MANUAL_LOG_ID", "").strip()
     }
 
-DRIVERS_PER_GRID = int(os.environ.get("DRIVERS_PER_GRID", 15))
-MAX_GRIDS = int(os.environ.get("MAX_GRIDS", 4))
-REG_END_TIME = os.environ.get("REGISTRATION_END_TIME", "").strip()
-SET_MANUAL_LOG_ID = os.environ.get("SET_MANUAL_LOG_ID", "").strip()
-
 APOLLO_BOT_ID = "475744554910351370"
-STATE_FILE = "state.json"
 LOG_FILE = "event_log.txt"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
@@ -50,39 +49,45 @@ def read_persistent_log():
         return [line.strip() for line in f.readlines() if line.strip()]
 
 def restore_log_from_discord(config):
-    """Liest die letzte Bot-Nachricht in Discord, um das Log wiederherzustellen."""
     if os.path.exists(LOG_FILE): return
     headers = {"Authorization": f"Bot {config['TOKEN_APOLLO']}"}
-    msg_id = SET_MANUAL_LOG_ID
     
-    # Wenn keine ID fixiert ist, suchen wir die letzte Nachricht im Kanal
+    # Sicherstellen, dass CHAN_LOG existiert
+    if not config['CHAN_LOG']: return
+
     url = f"https://discord.com/api/v10/channels/{config['CHAN_LOG']}/messages"
-    if msg_id: url += f"/{msg_id}"
-    else: url += "?limit=5"
+    if config['SET_MANUAL_LOG_ID']: 
+        url += f"/{config['SET_MANUAL_LOG_ID']}"
+    else: 
+        url += "?limit=10"
     
-    res = requests.get(url, headers=headers)
-    if res.status_code == 200:
-        data = res.json()
-        msg = data if msg_id else next((m for m in data if "```" in m.get("content", "")), None)
-        if msg:
-            # Extrahiere Text zwischen den Code-Blöcken
-            match = re.search(r"```\n(.*?)\n```", msg["content"], re.DOTALL)
-            if match:
-                content = match.group(1)
-                if content and "..." not in content: # Nur wenn Log nicht gekürzt war
-                    with open(LOG_FILE, "w", encoding="utf-8") as f:
-                        f.write(content)
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            msg = data if config['SET_MANUAL_LOG_ID'] else next((m for m in data if "```" in m.get("content", "")), None)
+            if msg:
+                match = re.search(r"```\n(.*?)\n```", msg["content"], re.DOTALL)
+                if match:
+                    content = match.group(1).replace("...", "").strip()
+                    if content:
+                        with open(LOG_FILE, "w", encoding="utf-8") as f:
+                            f.write(content + "\n")
+    except: pass
 
 def reconstruct_drivers_from_log():
     current_drivers = []
-    log_lines = read_persistent_log()
-    for line in log_lines:
+    for line in read_persistent_log():
         if " 🟢 " in line:
-            name = line.split(" 🟢 ")[1].replace(" (Waitlist)", "").replace(" (Nachgerückt)", "").strip()
-            if name not in current_drivers: current_drivers.append(name)
+            parts = line.split(" 🟢 ")
+            if len(parts) > 1:
+                name = parts[1].replace(" (Waitlist)", "").replace(" (Nachgerückt)", "").strip()
+                if name not in current_drivers: current_drivers.append(name)
         elif " 🔴 " in line:
-            name = line.split(" 🔴 ")[1].strip()
-            if name in current_drivers: current_drivers.remove(name)
+            parts = line.split(" 🔴 ")
+            if len(parts) > 1:
+                name = parts[1].strip()
+                if name in current_drivers: current_drivers.remove(name)
     return current_drivers
 
 def lobby_cleanup(config):
@@ -96,15 +101,25 @@ def lobby_cleanup(config):
             time.sleep(0.4)
     requests.post(url, headers=headers, json={"content": config["MSG_LOBBY"]})
 
+def extract_data(embed):
+    title = embed.get("title", "Unbekanntes Event")
+    drivers = []
+    for field in embed.get("fields", []):
+        if any(kw in field.get("name", "") for kw in ["Accepted", "Anmeldung", "Confirmed", "Zusagen"]):
+            for line in field.get("value", "").split("\n"):
+                c = re.sub(r"^\d+[\s.)-]*", "", line).strip()
+                if c and "Grid" not in c and len(c) > 1: drivers.append(c)
+    return title, drivers
+
 # --- MAIN ---
 @app.route('/')
 def home():
-    config = get_env_config()
+    config = get_config()
     if not all([config["TOKEN_APOLLO"], config["CHAN_APOLLO"], config["CHAN_LOG"]]):
-        return "Config Error", 500
+        return "Config Error: Kritische Variablen fehlen.", 500
 
     try:
-        # 1. VERSUCHE WIEDERHERSTELLUNG AUS DISCORD
+        # 1. Wiederherstellung
         restore_log_from_discord(config)
         
         headers = {"Authorization": f"Bot {config['TOKEN_APOLLO']}"}
@@ -114,33 +129,25 @@ def home():
 
         event_title, apollo_drivers = extract_data(apollo_msg["embeds"][0])
         now = get_now()
-        now_iso = now.isoformat()
         wd = now.weekday()
-        grid_cap = MAX_GRIDS * DRIVERS_PER_GRID
+        grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
         
-        # Lock Prüfung
         is_locked = (wd == 6 and now.hour >= 18) or (wd == 0)
-        if not is_locked and wd == 0 and REG_END_TIME:
+        if not is_locked and wd == 0 and config['REG_END_TIME']:
             try:
-                h, m = map(int, REG_END_TIME.split(":"))
+                h, m = map(int, config['REG_END_TIME'].split(":"))
                 if now >= now.replace(hour=h, minute=m, second=0, microsecond=0): is_locked = True
             except: pass
         if wd == 1 and now.hour < 10: is_locked = True
 
-        # State simulieren (da Datei nach Deploy weg)
+        log_lines = read_persistent_log()
         logged_drivers = reconstruct_drivers_from_log()
         
-        # Ist es ein ID-Wechsel? (Wir prüfen gegen die letzte Zeile des Logs)
-        last_log = read_persistent_log()
-        is_new = False
-        if not last_log or (event_title not in last_log[0] and "✨" in last_log[0]):
-             # Wenn Titel im Log nicht zum aktuellen Apollo-Titel passt -> Neues Event
-             is_new = True
-
+        is_new = not log_lines or (event_title not in log_lines[0] and "✨" in log_lines[0])
         webhook_type = "update"
         added, removed = [], []
 
-        if is_new or not os.path.exists(LOG_FILE):
+        if is_new:
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             webhook_type = "event_reset"
             write_to_persistent_log(f"{format_ts_short(now)} ✨ Event gestartet ({event_title})")
@@ -148,16 +155,14 @@ def home():
             for idx, d in enumerate(apollo_drivers):
                 icon = "🟢" if idx < grid_cap else "🟡"
                 write_to_persistent_log(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
-            added = apollo_drivers # Für Webhook
+            added = apollo_drivers
         else:
-            # Änderungen basierend auf rekonstruiertem Log ermitteln
+            if log_lines and "⚡ Systemstart" not in log_lines[-1]:
+                write_to_persistent_log(f"{format_ts_short(now)} ⚡ Systemstart ({event_title})")
+            
             added = [d for d in apollo_drivers if clean_for_log(d) not in logged_drivers]
             removed = [d for d in logged_drivers if d not in [clean_for_log(ad) for ad in apollo_drivers]]
             
-            # Systemstart Zeile einfügen, falls wir gerade erst hochgefahren sind
-            if "⚡ Systemstart" not in last_log[-1]:
-                write_to_persistent_log(f"{format_ts_short(now)} ⚡ Systemstart ({event_title})")
-
             for d in added:
                 idx = apollo_drivers.index(d)
                 icon = "🟢" if idx < grid_cap else "🟡"
@@ -166,9 +171,9 @@ def home():
                 write_to_persistent_log(f"{format_ts_short(now)} 🔴 {d_name}")
 
         driver_count = len(apollo_drivers)
-        grid_count = min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
+        grid_count = min(math.ceil(driver_count/config['DRIVERS_PER_GRID']), config['MAX_GRIDS'])
 
-        # Webhook Sync
+        sync_ts = "--"
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
             if not is_locked or is_new:
                 payload = {
@@ -177,15 +182,41 @@ def home():
                     "drivers": [raw_for_make(d) for d in apollo_drivers],
                     "grids": grid_count,
                     "log_history": "\n".join(read_persistent_log()),
-                    "timestamp": now_iso
+                    "timestamp": now.isoformat()
                 }
                 requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
+                sync_ts = format_ts_short(now)
 
-        # Discord Log Update
-        # Wir brauchen die msg_id aus einem temporären State oder suchen sie erneut
-        res_log = send_or_edit_log(driver_count, grid_count, is_locked, config)
+        send_or_edit_log(driver_count, grid_count, is_locked, config, sync_ts)
         return "OK"
 
     except Exception as e: return f"Error: {str(e)}", 500
 
-# ... Restliche Funktionen (send_or_edit_log etc.) wie in V60 ...
+def send_or_edit_log(driver_count, grid_count, is_locked, config, sync_ts):
+    headers = {"Authorization": f"Bot {config['TOKEN_APOLLO']}", "Content-Type": "application/json"}
+    grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
+    icon = "🟡" if is_locked and driver_count >= grid_cap else ("🔴" if is_locked else "🟢")
+    status = "Anmeldung geöffnet / Registration open" if not is_locked else ("Grids gesperrt & voll / Grids full" if driver_count >= grid_cap else "Grids gesperrt / Locked")
+    
+    full_log = read_persistent_log()
+    log_text = ""
+    for entry in reversed(full_log):
+        if len(log_text) + len(entry) + 15 > 980:
+            log_text = "...\n" + log_text
+            break
+        log_text = entry + "\n" + log_text
+    
+    legend = "🟢 Angemeldet / Registered\n🟡 Warteliste / Waitlist\n🔴 Abgemeldet / Withdrawn"
+    formatted = (f"{icon} **{status}**\nFahrer / Drivers: `{driver_count}` | Grids: `{grid_count}`\n\n"
+                 f"```\n{log_text or 'Initialisiere...'}```\n"
+                 f"*Stand: {format_ts_short(get_now())}*\n"
+                 f"*Letzte Übertragung / Last Grid Sync: {sync_ts}*\n\n**Legende:**\n{legend}")
+
+    tid = config['SET_MANUAL_LOG_ID']
+    if tid:
+        requests.patch(f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_LOG']}/messages/{tid}", headers=headers, json={"content": formatted})
+    else:
+        requests.post(f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){config['CHAN_LOG']}/messages", headers=headers, json={"content": formatted})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
