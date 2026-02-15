@@ -34,6 +34,7 @@ LOG_LOCK = threading.Lock()
 
 app = Flask(__name__)
 
+# --- HELFER ---
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
 def format_ts_short(dt_obj):
     days = {"Mon":"Mo", "Tue":"Di", "Wed":"Mi", "Thu":"Do", "Fri":"Fr", "Sat":"Sa", "Sun":"So"}
@@ -42,22 +43,20 @@ def format_ts_short(dt_obj):
     return raw
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
-
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
     return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "event_title": "Unbekannt", "manual_grids": None, "frozen_grids": None}
-
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
-
 def read_persistent_log():
     if not os.path.exists(LOG_FILE): return []
     with LOG_LOCK:
         with open(LOG_FILE, "r", encoding="utf-8") as f: return [l.strip() for l in f if l.strip()]
 
+# --- FEATURES ---
 def send_combined_news(conf, key_base, **kwargs):
     if not conf["CHAN_NEWS"]: return
     msg_de = os.environ.get(key_base, "")
@@ -81,16 +80,21 @@ def lobby_cleanup(conf):
         time.sleep(0.4)
     if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
+# --- MAIN ---
 @app.route('/')
 def home():
     conf = get_env_config()
     state = load_state()
     now = get_now()
     
-    # URL OVERRIDE
+    # URL OVERRIDE MIT RESET-FUNKTION (grids=0)
     url_grid_param = request.args.get('grids', type=int)
     if url_grid_param is not None:
-        state["manual_grids"] = url_grid_param
+        if url_grid_param == 0:
+            state["manual_grids"] = None
+            state["frozen_grids"] = None
+        else:
+            state["manual_grids"] = url_grid_param
         save_state(state)
     
     try:
@@ -110,7 +114,6 @@ def home():
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
         is_sun_18 = (now.weekday() == 6 and now.hour >= 18)
         
-        # Montage-Ende (Rot)
         is_final_lock = False
         if now.weekday() == 0:
             try:
@@ -124,26 +127,23 @@ def home():
             lobby_cleanup(conf)
             state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "manual_grids": None, "frozen_grids": None}
 
-        # Grid Berechnung & Lock
         count = len(drivers)
         grid_cap_base = conf["MAX_GRIDS"] * conf["DRIVERS_PER_GRID"]
         
-        # Automatisches Einfrieren am Sonntag 18:00
-        if is_sun_18 and state.get("frozen_grids") is None:
-            # Berechne aktuelle Grids zum Zeitpunkt des Freezes
+        # Automatischer Lock Sonntag 18 Uhr
+        if is_sun_18 and state.get("frozen_grids") is None and state.get("manual_grids") is None:
             calc_grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
             if conf["ENABLE_EXTRA"] and count > grid_cap_base + conf["EXTRA_THRESH"]: calc_grids += 1
             state["frozen_grids"] = calc_grids
             save_state(state)
 
-        # Grids bestimmen (Prio: URL-Manual > Frozen > Auto)
-        is_manual_active = False
+        is_lock_active = False
         if state.get("manual_grids") is not None:
             grids = state["manual_grids"]
-            is_manual_active = True
+            is_lock_active = True
         elif state.get("frozen_grids") is not None:
             grids = state["frozen_grids"]
-            is_manual_active = True # Verhält sich wie Lock
+            is_lock_active = True
         else:
             grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
             if conf["ENABLE_EXTRA"] and count > grid_cap_base + conf["EXTRA_THRESH"]:
@@ -152,26 +152,24 @@ def home():
                     send_combined_news(conf, "SET_MSG_EXTRA_GRID_TEXT")
                     state["extra_msg_sent"] = True
 
-        current_grid_cap = grids * conf["DRIVERS_PER_GRID"]
-
-        # Log & News
+        current_cap = grids * conf["DRIVERS_PER_GRID"]
         log_content = "\n".join(read_persistent_log())
         added = [d for d in drivers if clean_for_log(d) not in log_content]
         removed = [d for d in state.get("drivers", []) if d not in drivers]
-        moved_up = [d for d in drivers if d in state.get("drivers", []) and drivers.index(d) < current_grid_cap and state.get("drivers", []).index(d) >= current_grid_cap]
+        moved_up = [d for d in drivers if d in state.get("drivers", []) and drivers.index(d) < current_cap and state.get("drivers", []).index(d) >= current_cap]
 
         if added or removed or moved_up:
             with LOG_LOCK:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for d in added:
                         idx = drivers.index(d)
-                        icon = "🟡" if idx >= current_grid_cap else "🟢"
-                        f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_grid_cap else ''}\n")
+                        icon = "🟡" if idx >= current_cap else "🟢"
+                        f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}\n")
                     for d in moved_up: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)} (Nachgerückt)\n")
                     for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
         if conf["SW_SUN"] and is_sun_18 and not state.get("sun_msg_sent"):
-            free = max(0, current_grid_cap - count)
+            free = max(0, current_cap - count)
             send_combined_news(conf, "MSG_SUNDAY_TEXT", driver_count=count, grids=grids, free_slots=free)
             state["sun_msg_sent"] = True
 
@@ -180,21 +178,42 @@ def home():
             requests.post(conf["MAKE_WEBHOOK"], json=payload)
             state["last_make_sync"] = now.isoformat()
 
-        send_or_edit_log(conf, state, count, grids, is_final_lock, is_manual_active, current_grid_cap)
+        send_or_edit_log(conf, state, count, grids, is_final_lock, is_lock_active, current_cap)
         state["drivers"] = drivers
         save_state(state)
-        return render_dashboard(state, count, grids, is_final_lock, is_manual_active, current_grid_cap)
+        
+        return render_dashboard(state, count, grids, is_final_lock, is_lock_active, current_cap)
     except Exception as e: return f"Error: {str(e)}", 500
+
+def render_dashboard(state, count, grids, is_final, is_locked, cap):
+    log_entries = read_persistent_log()[-20:]
+    log_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:2px;'>{l}</div>" for l in reversed(log_entries)])
+    if is_final: s_txt, s_col = "GESCHLOSSEN (Closed)", "#f44336"
+    elif count >= cap: s_txt, s_col = "WARTELISTE (Waitlist)", "#ff9800"
+    else: s_txt, s_col = "OFFEN (Open)", "#4CAF50"
+    ov_tag = " <span style='font-size:0.6em; color:red;'>(LOCK 🔒)</span>" if is_locked else ""
+    return f"""
+    <html><head><title>Apollo Monitor</title><meta http-equiv="refresh" content="30"></head>
+    <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
+        <div style="max-width:800px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="margin-top:0;">🏁 Apollo Event Monitor</h2>
+            <div style="padding:15px; background:#fafafa; border-left:5px solid {s_col}; margin-bottom:20px;">
+                <b>Event:</b> {state.get('event_title', 'Unbekannt')} | <span style="color:{s_col}; font-weight:bold;">● {s_txt}</span>
+            </div>
+            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:20px; text-align:center;">
+                <div style="background:#e3f2fd; padding:15px; border-radius:8px;">Fahrer: <br><b>{count}</b></div>
+                <div style="background:#e8f5e9; padding:15px; border-radius:8px;">Grids: <br><b>{grids}{ov_tag}</b></div>
+                <div style="background:#fff3e0; padding:15px; border-radius:8px;">Sync: <br><b>{state.get('last_make_sync','--').split('T')[-1][:5]}</b></div>
+            </div>
+            <div style="background:#1e1e1e; color:#d4d4d4; padding:15px; border-radius:8px; font-family:monospace; font-size:0.9em; height:300px; overflow-y:auto;">{log_html}</div>
+        </div></body></html>
+    """
 
 def send_or_edit_log(conf, state, count, grids, is_final, is_locked, cap):
     if not conf["CHAN_LOG"]: return
-    if is_final:
-        icon, status = "🔴", "Anmeldung geschlossen / Registration closed"
-    elif count >= cap:
-        icon, status = "🟡", "Anmeldung auf Warteliste / Waitlist registration"
-    else:
-        icon, status = "🟢", "Anmeldung geöffnet / Open"
-    
+    if is_final: icon, status = "🔴", "Anmeldung geschlossen / Registration closed"
+    elif count >= cap: icon, status = "🟡", "Anmeldung auf Warteliste / Waitlist registration"
+    else: icon, status = "🟢", "Anmeldung geöffnet / Open"
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state["last_make_sync"]).astimezone(BERLIN_TZ)) if state.get("last_make_sync") else "--"
     grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
     content = (f"{icon} **{status}**\nFahrer: `{count}` | Grids: `{grid_display}`\n\n"
@@ -202,12 +221,6 @@ def send_or_edit_log(conf, state, count, grids, is_final, is_locked, cap):
                f"*Stand: {format_ts_short(get_now())}* | *Sync: {sync_ts}*\n\n"
                f"**Legende:**\n🟢 Angemeldet / Registered\n🟡 Warteliste / Waitlist\n🔴 Abgemeldet / Withdrawn")
     requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{conf['MANUAL_LOG_ID']}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": content})
-
-def render_dashboard(state, count, grids, is_final, is_locked, cap):
-    if is_final: s_txt, s_col = "GESCHLOSSEN (Closed)", "#f44336"
-    elif count >= cap: s_txt, s_col = "WARTELISTE (Waitlist)", "#ff9800"
-    else: s_txt, s_col = "OFFEN (Open)", "#4CAF50"
-    return f"<html><body style='font-family:sans-serif; padding:20px;'><div style='max-width:600px; margin:auto; background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1); border-left:10px solid {s_col};'><h2>🏁 Apollo Dashboard</h2><p><b>Status:</b> {s_txt}</p><p>Fahrer: {count} | Grids: {grids}{' 🔒' if is_locked else ''}</p><hr><pre style='background:#f4f4f4; padding:10px;'>"+"\n".join(read_persistent_log()[-10:])+"</pre></div></body></html>"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
