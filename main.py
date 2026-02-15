@@ -3,9 +3,7 @@ from flask import Flask, request
 
 # ---------- CONFIG & URL-SCHUTZ ----------
 def get_env_config():
-    # Radikale Reinigung der IDs, um den "Connection Adapter"-Fehler zu verhindern
     def c_id(v): return re.sub(r'[^0-9]', '', str(v)) if v else ""
-    
     e = os.environ
     return {
         "TOKEN_APOLLO": e.get("DISCORD_TOKEN_APOLLOGRABBER"),
@@ -20,7 +18,6 @@ def get_env_config():
         "EXTRA_THRESH": int(e.get("EXTRA_GRID_THRESHOLD", 10)),
         "REG_END_TIME": e.get("REGISTRATION_END_TIME", "20:45").strip(),
         "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
-        # Schalter
         "SW_EXTRA": e.get("SET_MSG_EXTRA_GRID_TEXT") == "1",
         "SW_FULL": e.get("SET_MSG_GRID_FULL_TEXT") == "1",
         "SW_MOVE": e.get("SET_MSG_MOVED_UP_TEXT") == "1",
@@ -63,7 +60,7 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "drivers": [], "last_make_sync": None}
+    return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
@@ -74,6 +71,15 @@ def read_persistent_log():
         return [l.strip() for l in f if l.strip()]
 
 # ---------- FEATURES ----------
+def send_combined_news(conf, key_base, **kwargs):
+    if not conf["CHAN_NEWS"]: return
+    msg_de = get_random_msg(key_base, **kwargs)
+    msg_en = get_random_msg(key_base + "_EN", **kwargs)
+    if not msg_de: return
+    full_text = f"🇩🇪 {msg_de}" + (f"\n\n🇬🇧 {msg_en}" if msg_en else "")
+    h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
+    requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages", headers=h, json={"content": full_text})
+
 def lobby_cleanup(conf):
     if not conf["TOKEN_LOBBY"] or not conf["CHAN_CODES"]: return
     h = {"Authorization": f"Bot {conf['TOKEN_LOBBY']}"}
@@ -86,15 +92,6 @@ def lobby_cleanup(conf):
     if conf["MSG_LOBBY"]:
         requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
-def send_combined_news(conf, key_base, **kwargs):
-    if not conf["CHAN_NEWS"]: return
-    msg_de = get_random_msg(key_base, **kwargs)
-    msg_en = get_random_msg(key_base + "_EN", **kwargs)
-    if not msg_de: return
-    full_text = msg_de + (f"\n\n{msg_en}" if msg_en else "")
-    h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
-    requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages", headers=h, json={"content": full_text})
-
 # ---------- MAIN ----------
 @app.route('/')
 def home():
@@ -104,9 +101,7 @@ def home():
     try:
         api_url = "https://discord.com/api/v10/channels/" + conf["CHAN_APOLLO"] + "/messages?limit=10"
         h_apollo = {"Authorization": "Bot " + conf["TOKEN_APOLLO"]}
-        
         res = requests.get(api_url, headers=h_apollo, timeout=10)
-        if not res.ok: return f"Discord Error: {res.status_code}", 500
         
         apollo_msg = next((m for m in res.json() if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID and m.get("embeds")), None)
         if not apollo_msg: return "Waiting for Apollo..."
@@ -123,21 +118,21 @@ def home():
         grid_cap = conf["MAX_GRIDS"] * conf["DRIVERS_PER_GRID"]
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
         
-        # Lock Prüfung (20:45)
-        is_locked = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0)
+        # Zeit-Logik
+        is_sun_18 = (now.weekday() == 6 and now.hour >= 18)
+        is_locked = is_sun_18 or (now.weekday() == 0)
         if not is_locked and now.weekday() == 0:
             try:
                 hl, ml = map(int, conf["REG_END_TIME"].split(":"))
                 if now >= now.replace(hour=hl, minute=ml, second=0, microsecond=0): is_locked = True
             except: pass
 
-        # Event Reset / Init
         if is_new or not os.path.exists(LOG_FILE):
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(f"{format_ts_short(now)} ✨ Event: {event_title}\n")
             lobby_cleanup(conf)
-            state = {"event_id": apollo_msg["id"], "drivers": [], "last_make_sync": None}
+            state = {"event_id": apollo_msg["id"], "drivers": [], "last_make_sync": None, "sun_msg_sent": False}
 
         old_drivers = state.get("drivers", [])
         added = [d for d in drivers if d not in old_drivers]
@@ -156,51 +151,54 @@ def home():
                     for d in removed:
                         f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
-            # News Trigger
             if conf["SW_WAIT"] and any(drivers.index(d) >= grid_cap for d in added):
                 wl_names = [clean_for_log(d) for d in added if drivers.index(d) >= grid_cap]
-                k = "MSG_WAITLIST_MULTI" if len(wl_names) > 1 else "MSG_WAITLIST_SINGLE"
-                send_combined_news(conf, k, driver_names=", ".join(wl_names))
+                send_combined_news(conf, "MSG_WAITLIST_MULTI" if len(wl_names) > 1 else "MSG_WAITLIST_SINGLE", driver_names=", ".join(wl_names))
 
             if conf["SW_MOVE"] and moved_up:
-                k = "MSG_MOVED_UP_MULTI" if len(moved_up) > 1 else "MSG_MOVED_UP_SINGLE"
-                send_combined_news(conf, k, driver_names=", ".join([clean_for_log(d) for d in moved_up]))
+                send_combined_news(conf, "MSG_MOVED_UP_MULTI" if len(moved_up) > 1 else "MSG_MOVED_UP_SINGLE", driver_names=", ".join([clean_for_log(d) for d in moved_up]))
 
-        # Grid-Logik & Webhook
+        # Sonntag 18:00 News
+        if conf["SW_SUN"] and is_sun_18 and not state.get("sun_msg_sent", False):
+            count = len(drivers)
+            grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
+            free = (grids * conf["DRIVERS_PER_GRID"]) - count
+            send_combined_news(conf, "MSG_SUNDAY_TEXT", driver_count=count, grids=grids, free_slots=max(0, free))
+            state["sun_msg_sent"] = True
+
+        # Webhook & Sync
         count = len(drivers)
         grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
-        if conf["ENABLE_EXTRA"] and count > grid_cap + conf["EXTRA_THRESH"]:
-            grids += 1
-            if conf["SW_EXTRA"] and not any("🏗️" in l for l in read_persistent_log()[-5:]):
-                send_combined_news(conf, "MSG_EXTRA_GRID_TEXT")
+        if conf["ENABLE_EXTRA"] and count > grid_cap + conf["EXTRA_THRESH"]: grids += 1
 
         if conf["MAKE_WEBHOOK"] and (added or removed or is_new):
-            payload = {
-                "type": "event_reset" if is_new else "update",
-                "driver_count": count, "drivers": [raw_for_make(d) for d in drivers],
-                "grids": grids, "log_history": "\n".join(read_persistent_log()),
-                "timestamp": now.isoformat()
-            }
+            payload = {"type": "event_reset" if is_new else "update", "driver_count": count, "drivers": [raw_for_make(d) for d in drivers], "grids": grids, "log_history": "\n".join(read_persistent_log()), "timestamp": now.isoformat()}
             requests.post(conf["MAKE_WEBHOOK"], json=payload)
             state["last_make_sync"] = now.isoformat()
 
-        send_or_edit_log(conf, state, count, grids, is_locked)
+        send_or_edit_log(conf, state, count, grids, is_locked, grid_cap)
         state["drivers"] = drivers
         save_state(state)
-        return "OK - V86"
-    except Exception as e: return f"Fehler: {str(e)}", 500
+        return "OK - V87"
+    except Exception as e: return f"Error: {str(e)}", 500
 
-def send_or_edit_log(conf, state, count, grids, is_locked):
+def send_or_edit_log(conf, state, count, grids, is_locked, grid_cap):
     if not conf["CHAN_LOG"]: return
     log_text = "\n".join(read_persistent_log()[-15:])
-    status = "Anmeldung geöffnet / Open" if not is_locked else "Grids gesperrt / Locked"
-    icon = "🔒" if is_locked else "🟢"
-    sync_ts = format_ts_short(datetime.datetime.fromisoformat(state["last_make_sync"]).astimezone(BERLIN_TZ)) if state.get("last_make_sync") else "--"
     
+    # Sonntags-Logik für Icons & Text
+    if is_locked:
+        if count >= grid_cap:
+            icon, status = "🟡", "Anmeldung auf Warteliste / Waitlist registration"
+        else:
+            icon, status = "🔒", "Grids gesperrt / Locked"
+    else:
+        icon, status = "🟢", "Anmeldung geöffnet / Open"
+
+    sync_ts = format_ts_short(datetime.datetime.fromisoformat(state["last_make_sync"]).astimezone(BERLIN_TZ)) if state.get("last_make_sync") else "--"
     content = (f"{icon} **{status}**\nFahrer: `{count}` | Grids: `{grids}`\n\n"
                f"```\n{log_text}```\n"
-               f"*Stand: {format_ts_short(get_now())}* | *Sync: {sync_ts}*\n\n"
-               f"**Legende:**\n🟢 Angemeldet\n🟡 Warteliste\n🔴 Abgemeldet")
+               f"*Stand: {format_ts_short(get_now())}* | *Sync: {sync_ts}*")
     
     h = {"Authorization": "Bot " + conf["TOKEN_APOLLO"]}
     mid = conf["MANUAL_LOG_ID"]
