@@ -52,22 +52,15 @@ def read_persistent_log():
         return [line.strip() for line in f.readlines()]
 
 def lobby_cleanup(config):
-    """Löscht alle Nachrichten im Code-Channel und postet Begrüßungstext."""
-    if not config["TOKEN_LOBBY"] or not config["CHAN_CODES"]: return False
-    
+    if not config["TOKEN_LOBBY"] or not config["CHAN_CODES"]: return
     headers = {"Authorization": f"Bot {config['TOKEN_LOBBY']}"}
     url = f"https://discord.com/api/v10/channels/{config['CHAN_CODES']}/messages"
-    
-    # Letzte 100 Nachrichten holen
     res = requests.get(f"{url}?limit=100", headers=headers)
     if res.status_code == 200:
         for m in res.json():
             requests.delete(f"{url}/{m['id']}", headers=headers)
-            time.sleep(0.4) # Rate-Limit Schutz
-            
-    # Begrüßungstext posten
+            time.sleep(0.4)
     requests.post(url, headers=headers, json={"content": config["MSG_LOBBY"]})
-    return True
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -93,21 +86,14 @@ def extract_data(embed):
 @app.route('/')
 def home():
     config = get_env_config()
-    manual_cleanup = request.args.get('clearcodes') == '1'
-    
     if not all([config["TOKEN_APOLLO"], config["CHAN_APOLLO"], config["CHAN_LOG"]]):
-        return "Config Error: Fehlende Variablen", 500
-
-    cleanup_status = ""
-    if manual_cleanup:
-        success = lobby_cleanup(config)
-        cleanup_status = "✅ Lobby-Cleanup manuell ausgeführt.<br>" if success else "❌ Cleanup fehlgeschlagen.<br>"
+        return "Config Error", 500
 
     try:
         headers = {"Authorization": f"Bot {config['TOKEN_APOLLO']}"}
         res = requests.get(f"https://discord.com/api/v10/channels/{config['CHAN_APOLLO']}/messages?limit=10", headers=headers)
         apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return f"{cleanup_status}Kein Apollo-Post gefunden."
+        if not apollo_msg: return "Kein Apollo-Post."
 
         event_title, drivers = extract_data(apollo_msg["embeds"][0])
         state = load_state()
@@ -127,9 +113,12 @@ def home():
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
         webhook_type = "update"
 
-        if is_new or not os.path.exists(LOG_FILE):
+        # LOGIC FÜR PERSISTENZ
+        log_exists = os.path.exists(LOG_FILE)
+        
+        if is_new or not log_exists:
             if is_new:
-                if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+                if log_exists: os.remove(LOG_FILE)
                 webhook_type = "event_reset"
                 start_line = f"{format_ts_short(now)} ✨ Event gestartet ({event_title})"
                 lobby_cleanup(config)
@@ -137,6 +126,7 @@ def home():
                 start_line = f"{format_ts_short(now)} ⚡ Systemstart ({event_title})"
             
             write_to_persistent_log(start_line)
+            # Nur bei echtem NEUEN Event oder komplett fehlendem Log werden alle Fahrer geloggt
             for idx, d in enumerate(drivers):
                 icon = "🟢" if idx < grid_cap else "🟡"
                 write_to_persistent_log(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
@@ -144,10 +134,12 @@ def home():
             state.update({"event_id": apollo_msg["id"], "drivers": drivers})
             added, removed = [], []
         else:
+            # Normaler Betrieb oder Systemstart mit existierender Datei
             old = state.get("drivers", [])
             added = [d for d in drivers if d not in old]
             removed = [d for d in old if d not in drivers]
             
+            # Nur loggen, wenn sich wirklich etwas geändert hat (verhindert Log-Flut nach Deploy)
             for d in added:
                 idx = drivers.index(d)
                 icon = "🟢" if idx < grid_cap else "🟡"
@@ -158,8 +150,6 @@ def home():
         driver_count = len(drivers)
         grid_count = min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
 
-        # Sync-Status für Browser
-        webhook_status = "Keine Änderung"
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
             if not is_locked or is_new:
                 payload = {
@@ -172,15 +162,11 @@ def home():
                 }
                 requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
                 state["last_make_sync"] = now_iso
-                webhook_status = f"✅ {webhook_type}"
-            else:
-                webhook_status = "🚫 Lock"
 
         state["log_msg_id"] = send_or_edit_log(state, driver_count, grid_count, is_locked, config)
         state["drivers"] = drivers
         save_state(state)
-        
-        return f"<h2>Apollo-Monitor</h2>{cleanup_status}Status: {'LOCK' if is_locked else 'OPEN'}<br>Sync: {webhook_status}"
+        return "OK"
 
     except Exception as e: return f"Error: {str(e)}", 500
 
@@ -192,8 +178,9 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
     
     full_log = read_persistent_log()
     log_text = ""
+    # Von unten nach oben aufbauen bis Zeichenlimit
     for entry in reversed(full_log):
-        if len(log_text) + len(entry) + 5 > 980:
+        if len(log_text) + len(entry) + 10 > 980:
             log_text = "...\n" + log_text
             break
         log_text = entry + "\n" + log_text
