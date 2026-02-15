@@ -19,7 +19,6 @@ def get_env_config():
         "REG_END_TIME": e.get("REGISTRATION_END_TIME", "20:45").strip(),
         "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
         "SW_EXTRA": e.get("SET_MSG_EXTRA_GRID_TEXT") == "1",
-        "SW_FULL": e.get("SET_MSG_GRID_FULL_TEXT") == "1",
         "SW_MOVE": e.get("SET_MSG_MOVED_UP_TEXT") == "1",
         "SW_SUN": e.get("ENABLE_SUNDAY_MSG") == "1",
         "SW_WAIT": e.get("ENABLE_WAITLIST_MSG") == "1",
@@ -49,7 +48,7 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "event_title": "Unbekannt", "manual_grids": None}
+    return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "event_title": "Unbekannt", "manual_grids": None, "frozen_grids": None}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
@@ -86,8 +85,9 @@ def lobby_cleanup(conf):
 def home():
     conf = get_env_config()
     state = load_state()
+    now = get_now()
     
-    # URL OVERRIDE PRÜFUNG
+    # URL OVERRIDE
     url_grid_param = request.args.get('grids', type=int)
     if url_grid_param is not None:
         state["manual_grids"] = url_grid_param
@@ -107,57 +107,71 @@ def home():
                     c = re.sub(r"^\d+[\s.)-]*", "", line).strip()
                     if c: drivers.append(c)
 
-        now = get_now()
-        grid_cap = conf["MAX_GRIDS"] * conf["DRIVERS_PER_GRID"]
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
-        
-        # Lock Logik
         is_sun_18 = (now.weekday() == 6 and now.hour >= 18)
-        is_locked = (now.weekday() == 0)
-        if not is_locked and now.weekday() == 0:
+        
+        # Montage-Ende (Rot)
+        is_final_lock = False
+        if now.weekday() == 0:
             try:
                 hl, ml = map(int, conf["REG_END_TIME"].split(":"))
-                if now >= now.replace(hour=hl, minute=ml, second=0, microsecond=0): is_locked = True
+                if now >= now.replace(hour=hl, minute=ml, second=0, microsecond=0): is_final_lock = True
             except: pass
 
         if is_new or not os.path.exists(LOG_FILE):
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} ✨ Event: {event_title}\n")
             lobby_cleanup(conf)
-            # Reset bei neuem Event (Wichtig: manual_grids wird None)
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "manual_grids": None}
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "manual_grids": None, "frozen_grids": None}
 
+        # Grid Berechnung & Lock
+        count = len(drivers)
+        grid_cap_base = conf["MAX_GRIDS"] * conf["DRIVERS_PER_GRID"]
+        
+        # Automatisches Einfrieren am Sonntag 18:00
+        if is_sun_18 and state.get("frozen_grids") is None:
+            # Berechne aktuelle Grids zum Zeitpunkt des Freezes
+            calc_grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
+            if conf["ENABLE_EXTRA"] and count > grid_cap_base + conf["EXTRA_THRESH"]: calc_grids += 1
+            state["frozen_grids"] = calc_grids
+            save_state(state)
+
+        # Grids bestimmen (Prio: URL-Manual > Frozen > Auto)
+        is_manual_active = False
+        if state.get("manual_grids") is not None:
+            grids = state["manual_grids"]
+            is_manual_active = True
+        elif state.get("frozen_grids") is not None:
+            grids = state["frozen_grids"]
+            is_manual_active = True # Verhält sich wie Lock
+        else:
+            grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
+            if conf["ENABLE_EXTRA"] and count > grid_cap_base + conf["EXTRA_THRESH"]:
+                grids += 1
+                if conf["SW_EXTRA"] and not state.get("extra_msg_sent"):
+                    send_combined_news(conf, "SET_MSG_EXTRA_GRID_TEXT")
+                    state["extra_msg_sent"] = True
+
+        current_grid_cap = grids * conf["DRIVERS_PER_GRID"]
+
+        # Log & News
         log_content = "\n".join(read_persistent_log())
         added = [d for d in drivers if clean_for_log(d) not in log_content]
         removed = [d for d in state.get("drivers", []) if d not in drivers]
-        moved_up = [d for d in drivers if d in state.get("drivers", []) and drivers.index(d) < grid_cap and state.get("drivers", []).index(d) >= grid_cap]
+        moved_up = [d for d in drivers if d in state.get("drivers", []) and drivers.index(d) < current_grid_cap and state.get("drivers", []).index(d) >= current_grid_cap]
 
         if added or removed or moved_up:
             with LOG_LOCK:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for d in added:
                         idx = drivers.index(d)
-                        icon = "🟡" if idx >= grid_cap else "🟢"
-                        f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= grid_cap else ''}\n")
+                        icon = "🟡" if idx >= current_grid_cap else "🟢"
+                        f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_grid_cap else ''}\n")
                     for d in moved_up: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)} (Nachgerückt)\n")
                     for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
-        # Grid Logik (Manual > Auto)
-        count = len(drivers)
-        if state.get("manual_grids") is not None:
-            grids = state["manual_grids"]
-            is_manual = True
-        else:
-            grids = min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
-            if conf["ENABLE_EXTRA"] and count > grid_cap + conf["EXTRA_THRESH"]:
-                grids += 1
-                if conf["SW_EXTRA"] and not state.get("extra_msg_sent"):
-                    send_combined_news(conf, "SET_MSG_EXTRA_GRID_TEXT")
-                    state["extra_msg_sent"] = True
-            is_manual = False
-
         if conf["SW_SUN"] and is_sun_18 and not state.get("sun_msg_sent"):
-            free = max(0, (grids * conf["DRIVERS_PER_GRID"]) - count)
+            free = max(0, current_grid_cap - count)
             send_combined_news(conf, "MSG_SUNDAY_TEXT", driver_count=count, grids=grids, free_slots=free)
             state["sun_msg_sent"] = True
 
@@ -166,55 +180,34 @@ def home():
             requests.post(conf["MAKE_WEBHOOK"], json=payload)
             state["last_make_sync"] = now.isoformat()
 
-        send_or_edit_log(conf, state, count, grids, is_locked, is_sun_18, grid_cap, is_manual)
+        send_or_edit_log(conf, state, count, grids, is_final_lock, is_manual_active, current_grid_cap)
         state["drivers"] = drivers
         save_state(state)
-        
-        return render_dashboard(state, count, grids, is_locked, is_sun_18, grid_cap, is_manual)
+        return render_dashboard(state, count, grids, is_final_lock, is_manual_active, current_grid_cap)
     except Exception as e: return f"Error: {str(e)}", 500
 
-def render_dashboard(state, count, grids, is_locked, is_sun, grid_cap, is_manual):
-    log_entries = read_persistent_log()[-20:]
-    log_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:2px;'>{l}</div>" for l in reversed(log_entries)])
-    if is_locked: s_txt, s_col = "GESPERRT (Locked)", "#f44336"
-    elif is_sun and count >= grid_cap: s_txt, s_col = "WARTELISTE (Waitlist)", "#ff9800"
-    else: s_txt, s_col = "OFFEN (Open)", "#4CAF50"
-    ov_tag = " <span style='font-size:0.6em; color:red;'>(LOCK 🔒)</span>" if is_manual else ""
-    
-    return f"""
-    <html><head><title>Apollo Monitor</title><meta http-equiv="refresh" content="30"></head>
-    <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
-        <div style="max-width:800px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
-            <h2>🏁 Apollo Event Monitor</h2>
-            <div style="padding:15px; background:#fafafa; border-left:5px solid {s_col}; margin-bottom:20px;">
-                <b>Event:</b> {state.get('event_title', 'Unbekannt')} | <span style="color:{s_col}; font-weight:bold;">● {s_txt}</span>
-            </div>
-            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:20px; text-align:center;">
-                <div style="background:#e3f2fd; padding:15px; border-radius:8px;">Fahrer: <b>{count}</b></div>
-                <div style="background:#e8f5e9; padding:15px; border-radius:8px;">Grids: <b>{grids}{ov_tag}</b></div>
-                <div style="background:#fff3e0; padding:15px; border-radius:8px;">Sync: <b>{state.get('last_make_sync','--').split('T')[-1][:5]}</b></div>
-            </div>
-            <div style="background:#1e1e1e; color:#d4d4d4; padding:15px; border-radius:8px; font-family:monospace; font-size:0.9em; height:300px; overflow-y:auto;">{log_html}</div>
-        </div></body></html>
-    """
-
-def send_or_edit_log(conf, state, count, grids, is_locked, is_sun, grid_cap, is_manual):
+def send_or_edit_log(conf, state, count, grids, is_final, is_locked, cap):
     if not conf["CHAN_LOG"]: return
-    log_text = "\n".join(read_persistent_log()[-15:])
-    if is_locked: icon, status = "🔒", "Grids gesperrt / Locked"
-    elif is_sun and count >= grid_cap: icon, status = "🟡", "Anmeldung auf Warteliste / Waitlist registration"
-    else: icon, status = "🟢", "Anmeldung geöffnet / Open"
+    if is_final:
+        icon, status = "🔴", "Anmeldung geschlossen / Registration closed"
+    elif count >= cap:
+        icon, status = "🟡", "Anmeldung auf Warteliste / Waitlist registration"
+    else:
+        icon, status = "🟢", "Anmeldung geöffnet / Open"
     
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state["last_make_sync"]).astimezone(BERLIN_TZ)) if state.get("last_make_sync") else "--"
-    grid_display = f"{grids} 🔒" if is_manual else f"{grids}"
-    
+    grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
     content = (f"{icon} **{status}**\nFahrer: `{count}` | Grids: `{grid_display}`\n\n"
-               f"```\n{log_text}```\n"
+               f"```\n" + "\n".join(read_persistent_log()[-15:]) + "```\n"
                f"*Stand: {format_ts_short(get_now())}* | *Sync: {sync_ts}*\n\n"
                f"**Legende:**\n🟢 Angemeldet / Registered\n🟡 Warteliste / Waitlist\n🔴 Abgemeldet / Withdrawn")
-    
-    h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
-    if conf["MANUAL_LOG_ID"]: requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{conf['MANUAL_LOG_ID']}", headers=h, json={"content": content})
+    requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{conf['MANUAL_LOG_ID']}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": content})
+
+def render_dashboard(state, count, grids, is_final, is_locked, cap):
+    if is_final: s_txt, s_col = "GESCHLOSSEN (Closed)", "#f44336"
+    elif count >= cap: s_txt, s_col = "WARTELISTE (Waitlist)", "#ff9800"
+    else: s_txt, s_col = "OFFEN (Open)", "#4CAF50"
+    return f"<html><body style='font-family:sans-serif; padding:20px;'><div style='max-width:600px; margin:auto; background:#fff; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1); border-left:10px solid {s_col};'><h2>🏁 Apollo Dashboard</h2><p><b>Status:</b> {s_txt}</p><p>Fahrer: {count} | Grids: {grids}{' 🔒' if is_locked else ''}</p><hr><pre style='background:#f4f4f4; padding:10px;'>"+"\n".join(read_persistent_log()[-10:])+"</pre></div></body></html>"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
