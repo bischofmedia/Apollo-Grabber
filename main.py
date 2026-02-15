@@ -1,11 +1,21 @@
 import os, requests, json, re, math, datetime, pytz, time, random
 from flask import Flask, request
 
-# --- KONFIGURATION ---
+# --- KONFIGURATION MIT AGGRESSIVER REINIGUNG ---
 def get_config():
-    conf = {k: str(os.environ.get(k, "")).strip() for k in os.environ}
+    # Bereinigt IDs von unsichtbaren Zeichen, Klammern oder Markdown-Resten
+    def clean(val):
+        if not val: return ""
+        return re.sub(r'[^a-zA-Z0-9.\-_:/?=]', '', str(val)).strip()
+
+    conf = {k: os.environ.get(k, "") for k in os.environ}
     return {
         **conf,
+        "CHAN_APOLLO": clean(conf.get("CHAN_APOLLO")),
+        "CHAN_LOG": clean(conf.get("CHAN_LOG")),
+        "CHAN_NEWS": clean(clean(conf.get("CHAN_NEWS"))),
+        "CHAN_CODES": clean(conf.get("CHAN_CODES")),
+        "MAKE_WEBHOOK_URL": conf.get("MAKE_WEBHOOK_URL", "").strip(), 
         "DRIVERS_PER_GRID": int(conf.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(conf.get("MAX_GRIDS", 4)),
         "EXTRA_THRESHOLD": int(conf.get("EXTRA_GRID_THRESHOLD", 10)),
@@ -70,12 +80,11 @@ def restore_log_from_discord(config):
     token = config.get('DISCORD_TOKEN_APOLLOGRABBER')
     channel = config.get('CHAN_LOG')
     if not token or not channel: return
-    
     h = {"Authorization": f"Bot {token}"}
     target_id = config.get('SET_MANUAL_LOG_ID')
-    if target_id: url = f"https://discord.com/api/v10/channels/{channel}/messages/{target_id}"
-    else: url = f"https://discord.com/api/v10/channels/{channel}/messages?limit=10"
-    
+    url = f"https://discord.com/api/v10/channels/{channel}/messages"
+    if target_id: url += f"/{target_id}"
+    else: url += "?limit=10"
     try:
         res = requests.get(url, headers=h, timeout=5)
         if res.status_code == 200:
@@ -124,37 +133,27 @@ def reconstruct_drivers_from_log(lines=None):
             if name in current: current.remove(name)
     return current
 
-# --- TEST-LOGIK (V74) ---
+# --- TEST-LOGIK (V75 - VOLLSTÄNDIG) ---
 def run_simulation(config):
-    report = ["<html><body style='font-family:sans-serif; padding:20px; line-height:1.6;'>"]
-    report.append("<h1 style='color:#333;'>System-Simulation V74</h1>")
+    report = ["<html><body style='font-family:sans-serif; padding:20px;'>"]
+    report.append("<h1>System-Simulation V75</h1>")
     
-    # 1. Variablen-Check
-    report.append("<h3>1. Konfigurations-Check (Render-Variablen)</h3>")
-    report.append("<table border='1' style='border-collapse:collapse; width:100%;'>")
-    report.append("<tr style='background:#eee;'><th>Variable</th><th>Wert</th><th>Status</th></tr>")
-    important_keys = ["DISCORD_TOKEN_APOLLOGRABBER", "CHAN_APOLLO", "CHAN_LOG", "CHAN_NEWS", "ENABLE_EXTRA_GRID", "SET_MSG_GRID_FULL_TEXT", "ENABLE_SUNDAY_MSG", "REGISTRATION_END_TIME"]
-    for k in important_keys:
-        val = config.get(k, "FEHLT")
-        color = "green" if val not in ["FEHLT", ""] else "red"
-        display_val = "Hinterlegt" if "TOKEN" in k and val != "FEHLT" else val
-        report.append(f"<tr><td>{k}</td><td>{display_val}</td><td style='color:{color}'>{'OK' if color=='green' else 'PRÜFEN'}</td></tr>")
-    report.append("</table>")
-
-    # 2. Simulationen
-    grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
     dummy_now = get_now()
-    report.append("<h3>2. Simulation: Multi-Nachrücken</h3>")
-    moved_up = ["Test_Fahrer_A", "Test_Fahrer_B"]
-    news_move = send_combined_news(config, "MSG_MOVED_UP_MULTI", "MSG_MOVED_UP_MULTI_EN", test_mode=True, driver_names=", ".join(moved_up))
-    report.append(f"<div style='border-left:4px solid green; background:#f9fff9; padding:10px;'>{news_move.replace(chr(10), '<br>')}</div>")
+    fake_log = [f"{format_ts_short(dummy_now)} ✨ Event gestartet (Simulation GP)", f"{format_ts_short(dummy_now)} 🟢 Test_Fahrer_1"]
+    drivers = ["Test_Fahrer_1", "Test_Fahrer_2"]
 
-    report.append("<h3>3. Simulation: Make.com Webhook JSON</h3>")
-    fake_payload = {
-        "type": "update", "driver_count": 42, "grids": 3,
+    report.append("<h3>Simulation: Make.com Vollständiger Payload</h3>")
+    # Hier ist ALLES drin: type, driver_count, drivers, grids, log_history
+    full_payload = {
+        "type": "update",
+        "driver_count": len(drivers),
+        "drivers": [raw_for_make(d) for d in drivers],
+        "grids": 1,
+        "log_history": "\n".join(fake_log),
         "timestamp": dummy_now.isoformat()
     }
-    report.append(f"<pre style='background:#333; color:#fff; padding:10px;'>{json.dumps(fake_payload, indent=4)}</pre>")
+    report.append(f"<pre style='background:#333; color:#0f0; padding:15px; overflow:auto;'>{json.dumps(full_payload, indent=4)}</pre>")
+    
     report.append("</body></html>")
     return "".join(report)
 
@@ -168,24 +167,24 @@ def home():
         restore_log_from_discord(config)
         token = config.get("DISCORD_TOKEN_APOLLOGRABBER")
         chan_apollo = config.get("CHAN_APOLLO")
-        if not token or not chan_apollo: return "Config Missing", 500
+        if not token or not chan_apollo: return "Missing Config", 500
 
         h = {"Authorization": f"Bot {token}"}
         url = f"[https://discord.com/api/v10/channels/](https://discord.com/api/v10/channels/){chan_apollo}/messages?limit=10"
         res = requests.get(url, headers=h)
         
         apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "Waiting for Apollo..."
+        if not apollo_msg: return "No Apollo Msg"
 
         event_title, apollo_drivers = extract_data(apollo_msg["embeds"][0])
         now = get_now()
         grid_cap = config['MAX_GRIDS'] * config['DRIVERS_PER_GRID']
         
-        # Lock Prüfung (Montag 20:45)
+        # Lock Prüfung
         is_locked = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0)
-        if not is_locked and now.weekday() == 0 and config['REG_END_TIME']:
+        if not is_locked and now.weekday() == 0 and config.get('REGISTRATION_END_TIME'):
             try:
-                hl, ml = map(int, config['REG_END_TIME'].split(":"))
+                hl, ml = map(int, config['REGISTRATION_END_TIME'].split(":"))
                 if now >= now.replace(hour=hl, minute=ml, second=0, microsecond=0): is_locked = True
             except: pass
         if now.weekday() == 1 and now.hour < 10: is_locked = True
@@ -252,10 +251,13 @@ def home():
             send_combined_news(config, "MSG_SUNDAY_TEXT", "MSG_SUNDAY_TEXT_EN", driver_count=count, grids=grids, free_slots=max(0, free))
 
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
+            # PAYLOAD FIX: Hier sind alle Felder wieder aktiv
             payload = {
                 "type": "event_reset" if is_new else "update",
-                "driver_count": count, "drivers": [raw_for_make(d) for d in apollo_drivers],
-                "grids": grids, "log_history": "\n".join(read_persistent_log()),
+                "driver_count": count, 
+                "drivers": [raw_for_make(d) for d in apollo_drivers],
+                "grids": grids, 
+                "log_history": "\n".join(read_persistent_log()),
                 "timestamp": now.isoformat()
             }
             requests.post(config['MAKE_WEBHOOK_URL'], json=payload)
@@ -271,13 +273,7 @@ def send_or_edit_log(count, grids, is_locked, config):
     h = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     ic = "🔒" if is_locked else "🟢"
     st = "Grids gesperrt / Locked" if is_locked else "Anmeldung geöffnet / Open"
-    full_log = read_persistent_log()
-    log_text = ""
-    for entry in reversed(full_log):
-        if len(log_text) + len(entry) + 20 > 980:
-            log_text = "...\n" + log_text
-            break
-        log_text = entry + "\n" + log_text
+    log_text = "\n".join(read_persistent_log()[-15:]) # Letzte 15 Zeilen
     legend = "🟢 Angemeldet / Registered\n🟡 Warteliste / Waitlist\n🔴 Abgemeldet / Withdrawn"
     formatted = (f"{ic} **{st}**\nFahrer: `{count}` | Grids: `{grids}`\n\n"
                  f"```\n{log_text or 'Initialisiere...'}```\n"
