@@ -13,8 +13,6 @@ def get_env_config():
         "MAKE_WEBHOOK_URL": os.environ.get("MAKE_WEBHOOK_URL")
     }
 
-SET_DELETE_OLD_EVENT = os.environ.get("SET_DELETE_OLD_EVENT", "0") == "1"
-SET_EXTRA_GRID_THRESHOLD = int(os.environ.get("SET_EXTRA_GRID_THRESHOLD", 10))
 DRIVERS_PER_GRID = int(os.environ.get("DRIVERS_PER_GRID", 15))
 MAX_GRIDS = int(os.environ.get("MAX_GRIDS", 4))
 REG_END_TIME = os.environ.get("REGISTRATION_END_TIME", "").strip()
@@ -49,7 +47,7 @@ def write_to_persistent_log(line):
 def read_persistent_log():
     if not os.path.exists(LOG_FILE): return []
     with open(LOG_FILE, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f.readlines()]
+        return [line.strip() for line in f.readlines() if line.strip()]
 
 def lobby_cleanup(config):
     if not config["TOKEN_LOBBY"] or not config["CHAN_CODES"]: return
@@ -82,6 +80,20 @@ def extract_data(embed):
                 if c and "Grid" not in c and len(c) > 1: drivers.append(c)
     return title, drivers
 
+def reconstruct_drivers_from_log():
+    """Analysiert das Log, um den Stand der angemeldeten Fahrer zu ermitteln."""
+    current_drivers = []
+    log_lines = read_persistent_log()
+    for line in log_lines:
+        # Wir suchen nach den Icons im Log-Text (bereinigt)
+        if " 🟢 " in line:
+            name = line.split(" 🟢 ")[1].replace(" (Waitlist)", "").replace(" (Nachgerückt)", "").strip()
+            if name not in current_drivers: current_drivers.append(name)
+        elif " 🔴 " in line:
+            name = line.split(" 🔴 ")[1].strip()
+            if name in current_drivers: current_drivers.remove(name)
+    return current_drivers
+
 # --- MAIN ---
 @app.route('/')
 def home():
@@ -95,7 +107,7 @@ def home():
         apollo_msg = next((m for m in res.json() if m.get("author", {}).get("id") == APOLLO_BOT_ID and m.get("embeds")), None)
         if not apollo_msg: return "Kein Apollo-Post."
 
-        event_title, drivers = extract_data(apollo_msg["embeds"][0])
+        event_title, apollo_drivers = extract_data(apollo_msg["embeds"][0])
         state = load_state()
         now = get_now()
         now_iso = now.isoformat()
@@ -113,12 +125,9 @@ def home():
         is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
         webhook_type = "update"
 
-        # LOGIC FÜR PERSISTENZ
-        log_exists = os.path.exists(LOG_FILE)
-        
-        if is_new or not log_exists:
+        if is_new or not os.path.exists(LOG_FILE):
             if is_new:
-                if log_exists: os.remove(LOG_FILE)
+                if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
                 webhook_type = "event_reset"
                 start_line = f"{format_ts_short(now)} ✨ Event gestartet ({event_title})"
                 lobby_cleanup(config)
@@ -126,28 +135,34 @@ def home():
                 start_line = f"{format_ts_short(now)} ⚡ Systemstart ({event_title})"
             
             write_to_persistent_log(start_line)
-            # Nur bei echtem NEUEN Event oder komplett fehlendem Log werden alle Fahrer geloggt
-            for idx, d in enumerate(drivers):
+            for idx, d in enumerate(apollo_drivers):
                 icon = "🟢" if idx < grid_cap else "🟡"
                 write_to_persistent_log(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
             
-            state.update({"event_id": apollo_msg["id"], "drivers": drivers})
+            state.update({"event_id": apollo_msg["id"], "drivers": apollo_drivers})
             added, removed = [], []
         else:
-            # Normaler Betrieb oder Systemstart mit existierender Datei
-            old = state.get("drivers", [])
-            added = [d for d in drivers if d not in old]
-            removed = [d for d in old if d not in drivers]
+            # Systemstart mit existierendem Log: Wir schauen, was das Log sagt
+            logged_drivers = reconstruct_drivers_from_log()
             
-            # Nur loggen, wenn sich wirklich etwas geändert hat (verhindert Log-Flut nach Deploy)
+            # Wir müssen apollo_drivers (Rohdaten) gegen logged_drivers (bereinigt) prüfen
+            added = [d for d in apollo_drivers if clean_for_log(d) not in logged_drivers]
+            removed = [d for d in logged_drivers if d not in [clean_for_log(ad) for ad in apollo_drivers]]
+            
+            # Falls wir gerade erst gestartet sind (state['drivers'] leer), 
+            # setzen wir die Basis auf das rekonstruierte Log
+            if not state.get("drivers"):
+                state["drivers"] = [d for d in apollo_drivers if clean_for_log(d) in logged_drivers]
+
             for d in added:
-                idx = drivers.index(d)
+                idx = apollo_drivers.index(d)
                 icon = "🟢" if idx < grid_cap else "🟡"
                 write_to_persistent_log(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{'' if idx < grid_cap else ' (Waitlist)'}")
-            for d in removed:
-                write_to_persistent_log(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
+            
+            for d_name in removed:
+                write_to_persistent_log(f"{format_ts_short(now)} 🔴 {d_name}")
 
-        driver_count = len(drivers)
+        driver_count = len(apollo_drivers)
         grid_count = min(math.ceil(driver_count/DRIVERS_PER_GRID), MAX_GRIDS)
 
         if config['MAKE_WEBHOOK_URL'] and (added or removed or is_new):
@@ -155,7 +170,7 @@ def home():
                 payload = {
                     "type": webhook_type,
                     "driver_count": driver_count,
-                    "drivers": [raw_for_make(d) for d in drivers],
+                    "drivers": [raw_for_make(d) for d in apollo_drivers],
                     "grids": grid_count,
                     "log_history": "\n".join(read_persistent_log()),
                     "timestamp": now_iso
@@ -164,7 +179,7 @@ def home():
                 state["last_make_sync"] = now_iso
 
         state["log_msg_id"] = send_or_edit_log(state, driver_count, grid_count, is_locked, config)
-        state["drivers"] = drivers
+        state["drivers"] = apollo_drivers
         save_state(state)
         return "OK"
 
@@ -178,7 +193,6 @@ def send_or_edit_log(state, driver_count, grid_count, is_locked, config):
     
     full_log = read_persistent_log()
     log_text = ""
-    # Von unten nach oben aufbauen bis Zeichenlimit
     for entry in reversed(full_log):
         if len(log_text) + len(entry) + 10 > 980:
             log_text = "...\n" + log_text
