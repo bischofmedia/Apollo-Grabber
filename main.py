@@ -60,15 +60,16 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False}
+    return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "event_title": "Unbekannt"}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
 
 def read_persistent_log():
     if not os.path.exists(LOG_FILE): return []
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
-        return [l.strip() for l in f if l.strip()]
+    with LOG_LOCK:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip()]
 
 # ---------- FEATURES ----------
 def send_combined_news(conf, key_base, **kwargs):
@@ -104,7 +105,7 @@ def home():
         res = requests.get(api_url, headers=h_apollo, timeout=10)
         
         apollo_msg = next((m for m in res.json() if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID and m.get("embeds")), None)
-        if not apollo_msg: return "Waiting for Apollo..."
+        if not apollo_msg: return "Warte auf Apollo Nachricht..."
 
         embed = apollo_msg["embeds"][0]
         event_title, drivers = embed.get("title", "Event"), []
@@ -132,7 +133,7 @@ def home():
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(f"{format_ts_short(now)} ✨ Event: {event_title}\n")
             lobby_cleanup(conf)
-            state = {"event_id": apollo_msg["id"], "drivers": [], "last_make_sync": None, "sun_msg_sent": False}
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "sun_msg_sent": False}
 
         old_drivers = state.get("drivers", [])
         added = [d for d in drivers if d not in old_drivers]
@@ -179,19 +180,52 @@ def home():
         send_or_edit_log(conf, state, count, grids, is_locked, grid_cap)
         state["drivers"] = drivers
         save_state(state)
-        return "OK - V87"
-    except Exception as e: return f"Error: {str(e)}", 500
+        
+        # BROWSER AUSGABE (DASHBOARD)
+        return render_browser_dashboard(conf, state, count, grids, is_locked)
+    except Exception as e: return f"Systemfehler: {str(e)}", 500
+
+def render_browser_dashboard(conf, state, count, grids, is_locked):
+    log_entries = read_persistent_log()[-20:]
+    log_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:2px;'>{l}</div>" for l in reversed(log_entries)])
+    
+    status_color = "#f44336" if is_locked else "#4CAF50"
+    status_text = "GESPERRT (Locked)" if is_locked else "OFFEN (Open)"
+    sync_time = state.get('last_make_sync', 'Noch nie').split('T')[-1][:8] if state.get('last_make_sync') else '--'
+
+    html = f"""
+    <html>
+    <head><title>Apollo Monitor</title><meta http-equiv="refresh" content="30"></head>
+    <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
+        <div style="max-width:800px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="margin-top:0;">🏁 Apollo Event Monitor</h2>
+            <div style="display:flex; justify-content:space-between; margin-bottom:20px; padding:15px; background:#fafafa; border-radius:8px;">
+                <div><b>Event:</b> {state.get('event_title', 'Lade...')}</div>
+                <div style="color:{status_color}; font-weight:bold;">● {status_text}</div>
+            </div>
+            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:20px; text-align:center;">
+                <div style="background:#e3f2fd; padding:15px; border-radius:8px;">Fahrer: <br><b style="font-size:1.5em;">{count}</b></div>
+                <div style="background:#e8f5e9; padding:15px; border-radius:8px;">Grids: <br><b style="font-size:1.5em;">{grids}</b></div>
+                <div style="background:#fff3e0; padding:15px; border-radius:8px;">Letzter Sync: <br><b style="font-size:1.2em;">{sync_time}</b></div>
+            </div>
+            <h3>Verlauf (Letzte 20):</h3>
+            <div style="background:#1e1e1e; color:#d4d4d4; padding:15px; border-radius:8px; font-family:monospace; font-size:0.9em; height:300px; overflow-y:auto;">
+                {log_html}
+            </div>
+            <div style="margin-top:20px; font-size:0.8em; color:#888; text-align:center;">
+                Build V88 | Automatische Aktualisierung alle 30s
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 def send_or_edit_log(conf, state, count, grids, is_locked, grid_cap):
     if not conf["CHAN_LOG"]: return
     log_text = "\n".join(read_persistent_log()[-15:])
-    
-    # Sonntags-Logik für Icons & Text
     if is_locked:
-        if count >= grid_cap:
-            icon, status = "🟡", "Anmeldung auf Warteliste / Waitlist registration"
-        else:
-            icon, status = "🔒", "Grids gesperrt / Locked"
+        icon, status = ("🟡", "Anmeldung auf Warteliste / Waitlist registration") if count >= grid_cap else ("🔒", "Grids gesperrt / Locked")
     else:
         icon, status = "🟢", "Anmeldung geöffnet / Open"
 
