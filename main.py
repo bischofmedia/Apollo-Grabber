@@ -16,7 +16,7 @@ def get_env_config():
         "MAKE_WEBHOOK": e.get("MAKE_WEBHOOK_URL"),
         "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
-        "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)),
+        "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)), # Hier ist die Grenze hinterlegt
         "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
         "ENABLE_NEWS_CLEAN": e.get("ENABLE_NEWS_CLEANUP") == "1",
         "MSG_LOBBY": e.get("MSG_LOBBYCODES", "")
@@ -75,10 +75,7 @@ def news_cleanup(conf, state_log_id):
     h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
-    
-    # STRIKTER SCHUTZ: ID aus Render und flüchtige ID
     protected = [str(conf["MANUAL_LOG_ID"]), str(state_log_id)]
-
     if res.ok:
         for m in res.json():
             mid = str(m.get("id"))
@@ -101,19 +98,40 @@ def process_discord_commands(conf, state):
             author_id = str(m.get("author", {}).get("id"))
             if content.startswith("!") and author_id in conf["USER_ORGA"]:
                 requests.delete(f"https://discord.com/api/v10/channels/{target_chan}/messages/{m['id']}", headers=h)
+                
                 if content == "!help":
-                    send_order_feedback(conf, "**🛠️ RTC-Grabber**\n`!grids=X`, `!clean`, `!newevent`")
+                    help_msg = (
+                        "**🛠️ RTC Apollo Grabber V2 - Befehlsübersicht**\n\n"
+                        "`!grids=X` : Setzt die Gridanzahl manuell fest (z.B. `!grids=3`).\n"
+                        "            *Hinweis: `!grids=0` hebt die Sperre auf und aktiviert die Automatik.*\n"
+                        "`!clean`   : Löscht eigene Nachrichten im News-Kanal, bereinigt die Lobby-Codes und setzt die Make.com-Tabelle zurück.\n"
+                        "`!newevent`: Erzwingt einen Reset und startet die Protokollierung für das aktuelle Apollo-Event neu."
+                    )
+                    send_order_feedback(conf, help_msg)
+                
                 elif content == "!clean":
                     news_cleanup(conf, state.get("active_log_id"))
                     force_reset = True
+                    send_order_feedback(conf, "🧹 **Manuelle Säuberung:** Eigene News-Beiträge werden entfernt, Lobby-Codes bereinigt und Make.com für den Tabellen-Reset getriggert.")
+                
                 elif content == "!newevent":
                     force_reset = True
+                    send_order_feedback(conf, "🔄 **Manueller Event-Neustart:** Die bisherigen Fahrerdaten und das Log wurden zurückgesetzt. Ein neues Event-Protokoll wird initialisiert.")
+                
                 elif content.startswith("!grids="):
                     try:
                         val = int(content.split("=")[1])
-                        state["manual_grids"] = val if val > 0 else None
-                        save_state(state)
-                        send_order_feedback(conf, f"🔒 Grids: `{val}`")
+                        if val == 0:
+                            state["manual_grids"] = None
+                            save_state(state)
+                            send_order_feedback(conf, "🔓 **Grid-Sperre aufgehoben:** Die Anzahl der Grids wird nun wieder automatisch berechnet.")
+                        else:
+                            # Berücksichtigung von MAX_GRIDS
+                            final_val = min(val, conf["MAX_GRIDS"])
+                            state["manual_grids"] = final_val
+                            save_state(state)
+                            limit_info = f" (begrenzt auf das Maximum von {conf['MAX_GRIDS']})" if val > conf["MAX_GRIDS"] else ""
+                            send_order_feedback(conf, f"🔒 **Grid-Sperre aktiv:** Die Anzahl wurde fest auf `{final_val}` Grids gesetzt{limit_info}.")
                     except: pass
     return force_reset
 
@@ -160,7 +178,8 @@ def home():
                     if c: drivers.append(c)
 
         count = len(drivers)
-        grids = state.get("manual_grids") or min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
+        is_locked = state.get("manual_grids") is not None
+        grids = state.get("manual_grids") if is_locked else min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
         
         added = [d for d in drivers if d not in state.get("drivers", [])]
         removed = [d for d in state.get("drivers", []) if d not in drivers]
@@ -171,7 +190,6 @@ def home():
                     for d in added: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)}\n")
                     for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
-        # --- FIX: MAKE SYNC IMMER BEI ÄNDERUNG ---
         if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data):
             payload = {
                 "type": "event_reset" if should_reset_data else "update",
@@ -187,11 +205,12 @@ def home():
                     state["last_make_sync"] = now.isoformat()
             except: pass
 
-        # LOG-NACHRICHT FORMATIERUNG
         sync_time = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else "--"
+        grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
+        
         log_content = (
             f"**{event_title}**\n🟢 **Anmeldung geöffnet**\n"
-            f"Fahrer: `{count}` | Grids: `{grids}`\n"
+            f"Fahrer: `{count}` | Grids: `{grid_display}`\n"
             f"```\n" + "\n".join(read_persistent_log()[-15:]) + "```\n"
             f"*Stand: {format_ts_short(now)} | Sync: {sync_time}*"
         )
@@ -207,26 +226,25 @@ def home():
 
         state["drivers"] = drivers
         save_state(state)
-        return render_dashboard(state, count, grids)
+        return render_dashboard(state, count, grids, is_locked)
     except Exception as e: return f"Error: {str(e)}", 500
 
-def render_dashboard(state, count, grids):
+def render_dashboard(state, count, grids, is_locked):
     log_entries = read_persistent_log()[-50:]
     log_html = "".join([f"<div style='border-bottom:1px solid #333; padding:4px 2px;'>{l}</div>" for l in reversed(log_entries)])
+    ov_tag = " <span style='color:red;'>🔒</span>" if is_locked else ""
     return f"""
-    <html><head><title>Monitor V115</title><meta http-equiv="refresh" content="30"></head>
+    <html><head><title>Apollo Grabber V2</title><meta http-equiv="refresh" content="30"></head>
     <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
         <div style="max-width:900px; margin:auto; background:white; padding:20px; border-radius:10px;">
-            <h2>🏁 Monitor V115</h2>
+            <h2 style="margin-top:0;">🏁 Apollo Grabber V2</h2>
             <div style="padding:10px; background:#eee; margin-bottom:15px;"><b>Event:</b> {state.get('event_title')}</div>
             <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; text-align:center;">
                 <div style="background:#e3f2fd; padding:10px;">Fahrer: <b>{count}</b></div>
-                <div style="background:#e8f5e9; padding:10px;">Grids: <b>{grids}</b></div>
+                <div style="background:#e8f5e9; padding:10px;">Grids: <b>{grids}{ov_tag}</b></div>
                 <div style="background:#fff3e0; padding:10px;">ID: {state.get('active_log_id','--')}</div>
             </div>
-            <div style="background:#1e1e1e; color:#00ff00; padding:15px; margin-top:20px; height:450px; overflow-y:auto; font-family:monospace;">
-                {log_html}
-            </div>
+            <div style="background:#1e1e1e; color:#00ff00; padding:15px; margin-top:20px; height:450px; overflow-y:auto; font-family:monospace;">{log_html}</div>
         </div></body></html>"""
 
 if __name__ == "__main__":
