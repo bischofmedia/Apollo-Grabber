@@ -64,14 +64,21 @@ def read_persistent_log():
         with open(LOG_FILE, "r", encoding="utf-8") as f: 
             return [l.strip() for l in f if l.strip()]
 
+# --- NEWS SYSTEM (Zweisprachig & Multi) ---
 def send_combined_news(conf, key_base, **kwargs):
     if not conf["CHAN_NEWS"]: return
     msg_de = os.environ.get(key_base, "")
+    msg_en = os.environ.get(key_base.replace("MSG_", "MSG_EN_"), "")
     if not msg_de: return
+    
     def pick(t):
         opts = [o.strip() for o in t.split(";") if o.strip()]
         return random.choice(opts) if opts else t
+
     full_text = f"🇩🇪 {pick(msg_de).format(**kwargs)}"
+    if msg_en:
+        full_text += f"\n\n🇬🇧 {pick(msg_en).format(**kwargs)}"
+        
     requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages", 
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": full_text})
 
@@ -117,16 +124,13 @@ def process_discord_commands(conf, state):
                 
                 if content == "!help":
                     send_order_feedback(conf, f"**🛠️ RTC Grabber Hilfe** (Aufruf durch {user_name})\n`!grids=X`, `!clean`, `!newevent`")
-                
                 elif content == "!clean":
                     news_cleanup(conf, state.get("active_log_id"))
                     force_reset = True
                     send_order_feedback(conf, f"🧹 **Manuelle Säuberung:** {user_name} hat den Cleanup gestartet.")
-                
                 elif content == "!newevent":
                     force_reset = True
                     send_order_feedback(conf, f"🔄 **Event-Neustart:** {user_name} hat einen Reset erzwungen.")
-                
                 elif content.startswith("!grids="):
                     try:
                         val = int(content.split("=")[1])
@@ -199,20 +203,32 @@ def home():
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
                 if idx >= current_cap and conf["SW_WAIT"]:
                     send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
+            
             for d in removed: new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
 
+            # --- MULTI-NEWS & GRID CHANGE LOGIK ---
             old_cap = state.get("last_cap", 0)
             if current_cap != old_cap and old_cap > 0:
-                if current_cap < old_cap:
+                moved_to_wait = []
+                moved_to_grids = []
+                
+                if current_cap < old_cap: # Reduzierung
                     for i, d in enumerate(drivers):
                         if current_cap <= i < old_cap:
+                            moved_to_wait.append(clean_for_log(d))
                             new_log_entries.append(f"{format_ts_short(now)} 🟠 Warteliste: {clean_for_log(d)}")
-                            if conf["SW_WAIT"]: send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
-                else:
+                    if moved_to_wait and conf["SW_WAIT"]:
+                        key = "MSG_WAITLIST_MULTI" if len(moved_to_wait) > 1 else "MSG_WAITLIST_SINGLE"
+                        send_combined_news(conf, key, driver_names=", ".join(moved_to_wait))
+                
+                else: # Erhöhung
                     for i, d in enumerate(drivers):
                         if old_cap <= i < current_cap:
+                            moved_to_grids.append(clean_for_log(d))
                             new_log_entries.append(f"{format_ts_short(now)} 🔵 Nachgerückt: {clean_for_log(d)}")
-                            if conf["SW_MOVE"]: send_combined_news(conf, "MSG_MOVED_UP_SINGLE", driver_names=clean_for_log(d))
+                    if moved_to_grids and conf["SW_MOVE"]:
+                        key = "MSG_MOVED_UP_MULTI" if len(moved_to_grids) > 1 else "MSG_MOVED_UP_SINGLE"
+                        send_combined_news(conf, key, driver_names=", ".join(moved_to_grids))
 
         if new_log_entries:
             with LOG_LOCK:
