@@ -299,8 +299,7 @@ def render_dashboard(state, count, grids, is_locked):
         </div></body></html>"""
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))import os, requests, json, re, math, datetime, pytz, threading, time, random
-from flask import Flask
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 # ==============================================================================
 # BLOCK 1: KONFIGURATION & UMGEBUNGSVARIABLEN
@@ -627,5 +626,8 @@ def render_dashboard(state, count, grids, is_locked):
             <div style="background:#1e1e1e; color:#00ff00; padding:15px; margin-top:20px; height:450px; overflow-y:auto; font-family:monospace;">{log_html}</div>
         </div></body></html>"""
 
+# ==============================================================================
+# BLOCK 8: SERVER START
+# ==============================================================================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
