@@ -12,7 +12,7 @@ def get_env_config():
         "CHAN_LOG": c_id(e.get("CHAN_LOG")),
         "CHAN_NEWS": c_id(e.get("CHAN_NEWS")),
         "CHAN_CODES": c_id(e.get("CHAN_CODES")),
-        "CHAN_ORDERS": c_id(e.get("CHAN_ORDERS")), # Neuer Kanal für Befehle
+        "CHAN_ORDERS": c_id(e.get("CHAN_ORDERS")),
         "MAKE_WEBHOOK": e.get("MAKE_WEBHOOK_URL"),
         "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
@@ -25,10 +25,10 @@ def get_env_config():
         "SW_SUN": e.get("ENABLE_SUNDAY_MSG") == "1",
         "SW_WAIT": e.get("ENABLE_WAITLIST_MSG") == "1",
         "ENABLE_EXTRA": e.get("ENABLE_EXTRA_GRID") == "1",
+        "ENABLE_NEWS_CLEAN": e.get("ENABLE_NEWS_CLEANUP") == "1", # Neue Variable
         "MSG_LOBBY": e.get("MSG_LOBBYCODES", "")
     }
 
-APOLLO_BOT_ID = "475744554910351370"
 LOG_FILE = "event_log.txt"
 STATE_FILE = "state.json"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
@@ -45,6 +45,13 @@ def format_ts_short(dt_obj):
     return raw
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
+
+def get_bot_user_id(token):
+    try:
+        res = requests.get("https://discord.com/api/v10/users/@me", headers={"Authorization": f"Bot {token}"})
+        if res.ok: return str(res.json().get("id"))
+    except: pass
+    return None
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -85,9 +92,9 @@ def process_discord_commands(conf, state):
                     help_text = (
                         "**🛠️ Bot-Steuerung Hilfe**\n\n"
                         "`/grids=X` - Setzt die Grid-Anzahl fest (0 zum Entsperren).\n"
-                        "`/clean` - Löscht Bot-News, Lobby-Codes und triggert Make-Cleanup.\n"
+                        "`/clean` - Löscht eigene News, Lobby-Codes und leert Make-Tabelle.\n"
                         "`/newevent` - Erzwingt die Erkennung eines neuen Events.\n"
-                        "`/test` - Prüft die Befehlserkennung im Dashboard."
+                        "`/test` - Dashboard-Check."
                     )
                     send_order_feedback(conf, help_text)
                 elif content == "/clean":
@@ -95,43 +102,51 @@ def process_discord_commands(conf, state):
                     lobby_cleanup(conf)
                     if conf["MAKE_WEBHOOK"]:
                         requests.post(conf["MAKE_WEBHOOK"], json={"type": "event_reset", "timestamp": get_now().isoformat()})
-                    send_order_feedback(conf, "✅ **Säuberung durchgeführt:** News-Kanal, Lobby-Codes und Make-Tabelle wurden zurückgesetzt.")
+                    send_order_feedback(conf, "✅ **Manuelle Säuberung:** Eigene News (falls aktiviert), Lobby-Codes und Make-Tabelle wurden zurückgesetzt.")
                 elif content == "/newevent":
                     state["event_id"] = None
                     save_state(state)
-                    send_order_feedback(conf, "🔄 **Event-Reset:** Das aktuelle Apollo-Event wird beim nächsten Scan als neues Event initialisiert.")
+                    send_order_feedback(conf, "🔄 **Manueller Reset:** Das aktuelle Event wird beim nächsten Scan neu eingelesen.")
                 elif content.startswith("/grids="):
                     try:
                         val = int(content.split("=")[1])
                         state["manual_grids"] = val if val > 0 else None
                         if val == 0: state["frozen_grids"] = None
                         save_state(state)
-                        msg = f"🔒 **Grid-Lock:** Es wurden fest `{val}` Grids für dieses Event definiert." if val > 0 else "🔓 **Grid-Lock:** Die automatische Berechnung wurde wieder aktiviert."
+                        msg = f"🔒 **Grid-Lock:** Festgelegt auf `{val}` Grids." if val > 0 else "🔓 **Grid-Lock:** Automatik aktiv."
                         send_order_feedback(conf, msg)
                     except: pass
                 elif content == "/test":
-                    test_output = "Befehlserkennung: OK"
+                    test_output = "Befehl erkannt."
     return test_output
 
 # --- CLEANUP FEATURES ---
 def news_cleanup(conf):
-    if not conf["TOKEN_APOLLO"] or not conf["CHAN_NEWS"]: return
+    if not conf["ENABLE_NEWS_CLEAN"] or not conf["CHAN_NEWS"]: return
+    my_id = get_bot_user_id(conf["TOKEN_APOLLO"])
+    if not my_id: return
+    
     h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
     if res.ok:
         for m in res.json():
-            if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID:
+            if str(m.get("author", {}).get("id")) == my_id:
                 requests.delete(f"{url}/{m['id']}", headers=h)
-                time.sleep(0.2)
+                time.sleep(0.3)
 
 def lobby_cleanup(conf):
     if not conf["TOKEN_LOBBY"] or not conf["CHAN_CODES"]: return
+    my_id = get_bot_user_id(conf["TOKEN_LOBBY"])
+    if not my_id: return
+
     h = {"Authorization": f"Bot {conf['TOKEN_LOBBY']}"}
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_CODES']}/messages"
-    res = requests.get(f"{url}?limit=100", headers=h)
+    res = requests.get(f"{url}?limit=50", headers=h)
     if res.ok:
-        for m in res.json(): requests.delete(f"{url}/{m['id']}", headers=h)
+        for m in res.json():
+            if str(m.get("author", {}).get("id")) == my_id:
+                requests.delete(f"{url}/{m['id']}", headers=h)
         time.sleep(0.2)
     if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
@@ -146,7 +161,8 @@ def home():
     try:
         api_url = f"https://discord.com/api/v10/channels/{conf['CHAN_APOLLO']}/messages?limit=10"
         res = requests.get(api_url, headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, timeout=10)
-        apollo_msg = next((m for m in res.json() if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID and m.get("embeds")), None)
+        # Suchen nach der Event-Nachricht (Embed)
+        apollo_msg = next((m for m in res.json() if m.get("embeds")), None)
         if not apollo_msg: return "Warte auf Apollo..."
 
         embed = apollo_msg["embeds"][0]
@@ -154,6 +170,7 @@ def home():
         is_new = (state["event_id"] is None or state["event_id"] != apollo_msg["id"])
         
         if is_new:
+            # Cleanup nur am Dienstag ODER wenn manuell /newevent (event_id is None) getriggert wurde
             if now.weekday() == 1 or state["event_id"] is None:
                 news_cleanup(conf)
                 lobby_cleanup(conf)
