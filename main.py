@@ -95,7 +95,10 @@ def news_cleanup(conf, state_log_id):
     h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
+    
+    # Absoluter Schutz der IDs
     protected = [str(conf["MANUAL_LOG_ID"]), str(state_log_id)]
+    
     if res.ok:
         for m in res.json():
             mid = str(m.get("id"))
@@ -103,6 +106,20 @@ def news_cleanup(conf, state_log_id):
             if str(m.get("author", {}).get("id")) == my_id:
                 requests.delete(f"{url}/{mid}", headers=h)
                 time.sleep(0.3)
+
+def lobby_cleanup(conf):
+    if not conf["TOKEN_LOBBY"] or not conf["CHAN_CODES"]: return
+    my_id = get_bot_user_id(conf["TOKEN_LOBBY"])
+    if not my_id: return
+    h = {"Authorization": f"Bot {conf['TOKEN_LOBBY']}"}
+    url = f"https://discord.com/api/v10/channels/{conf['CHAN_CODES']}/messages"
+    res = requests.get(f"{url}?limit=50", headers=h)
+    if res.ok:
+        for m in res.json():
+            if str(m.get("author", {}).get("id")) == my_id:
+                requests.delete(f"{url}/{m['id']}", headers=h)
+        time.sleep(0.2)
+    if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
 # --- COMMANDS ---
 def process_discord_commands(conf, state):
@@ -123,14 +140,25 @@ def process_discord_commands(conf, state):
                 requests.delete(f"https://discord.com/api/v10/channels/{target_chan}/messages/{m['id']}", headers=h)
                 
                 if content == "!help":
-                    send_order_feedback(conf, f"**🛠️ RTC Grabber Hilfe** (Aufruf durch {user_name})\n`!grids=X`, `!clean`, `!newevent`")
+                    help_msg = (
+                        f"**🛠️ RTC Apollo Grabber V2 - Befehlsübersicht** (Aufruf durch {user_name})\n\n"
+                        "`!grids=X` : Setzt die Gridanzahl manuell fest (z.B. `!grids=3`).\n"
+                        "            *Hinweis: `!grids=0` hebt die Sperre auf und aktiviert die Automatik.*\n"
+                        "`!clean`   : Löscht alle eigenen Nachrichten im News-Kanal, bereinigt die Lobby-Codes und setzt die Make.com-Tabelle zurück.\n"
+                        "`!newevent`: Erzwingt einen sofortigen Reset aller Daten und startet die Protokollierung für das aktuelle Apollo-Event neu."
+                    )
+                    send_order_feedback(conf, help_msg)
+                
                 elif content == "!clean":
                     news_cleanup(conf, state.get("active_log_id"))
+                    lobby_cleanup(conf)
                     force_reset = True
                     send_order_feedback(conf, f"🧹 **Manuelle Säuberung:** {user_name} hat den Cleanup gestartet.")
+                
                 elif content == "!newevent":
                     force_reset = True
                     send_order_feedback(conf, f"🔄 **Event-Neustart:** {user_name} hat einen Reset erzwungen.")
+                
                 elif content.startswith("!grids="):
                     try:
                         val = int(content.split("=")[1])
@@ -175,6 +203,7 @@ def home():
 
         if should_reset_data:
             news_cleanup(conf, target_log_id)
+            lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} Event gestartet\n")
             state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": target_log_id, "last_cap": 0}
@@ -203,16 +232,13 @@ def home():
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
                 if idx >= current_cap and conf["SW_WAIT"]:
                     send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
-            
             for d in removed: new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
 
-            # --- MULTI-NEWS & GRID CHANGE LOGIK ---
             old_cap = state.get("last_cap", 0)
             if current_cap != old_cap and old_cap > 0:
                 moved_to_wait = []
                 moved_to_grids = []
-                
-                if current_cap < old_cap: # Reduzierung
+                if current_cap < old_cap:
                     for i, d in enumerate(drivers):
                         if current_cap <= i < old_cap:
                             moved_to_wait.append(clean_for_log(d))
@@ -220,8 +246,7 @@ def home():
                     if moved_to_wait and conf["SW_WAIT"]:
                         key = "MSG_WAITLIST_MULTI" if len(moved_to_wait) > 1 else "MSG_WAITLIST_SINGLE"
                         send_combined_news(conf, key, driver_names=", ".join(moved_to_wait))
-                
-                else: # Erhöhung
+                else:
                     for i, d in enumerate(drivers):
                         if old_cap <= i < current_cap:
                             moved_to_grids.append(clean_for_log(d))
@@ -275,7 +300,7 @@ def render_dashboard(state, count, grids, is_locked):
         <div style="max-width:900px; margin:auto; background:white; padding:20px; border-radius:10px;">
             <h2 style="margin-top:0;">🏁 Apollo Grabber V2</h2>
             <div style="padding:10px; background:#eee; margin-bottom:15px;"><b>Event:</b> {state.get('event_title')}</div>
-            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; text-align:center;">
+            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; text-align:center;">
                 <div style="background:#e3f2fd; padding:10px;">Fahrer: <b>{count}</b></div>
                 <div style="background:#e8f5e9; padding:10px;">Grids: <b>{grids}{ov_tag}</b></div>
                 <div style="background:#fff3e0; padding:10px;">ID: {state.get('active_log_id','--')}</div>
