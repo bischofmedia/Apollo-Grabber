@@ -67,7 +67,8 @@ def read_persistent_log():
     if not os.path.exists(LOG_FILE): return []
     with LOG_LOCK:
         if not os.path.exists(LOG_FILE): return []
-        with open(LOG_FILE, "r", encoding="utf-8") as f: return [l.strip() for l in f if l.strip()]
+        with open(LOG_FILE, "r", encoding="utf-8") as f: 
+            return [l.strip() for l in f if l.strip()]
 
 def send_order_feedback(conf, text):
     if not conf["CHAN_ORDERS"]: return
@@ -85,7 +86,6 @@ def news_cleanup(conf, current_log_id):
     if res.ok:
         for m in res.json():
             mid = str(m.get("id"))
-            # STRIKTER SCHUTZ: Log-Nachricht niemals löschen
             if mid == conf["MANUAL_LOG_ID"] or mid == current_log_id: continue
             if str(m.get("author", {}).get("id")) == my_id:
                 requests.delete(f"{url}/{mid}", headers=h)
@@ -117,21 +117,30 @@ def process_discord_commands(conf, state):
         for m in res.json():
             content = m.get("content", "").strip().lower()
             author_id = str(m.get("author", {}).get("id"))
-            if content.startswith("/") and author_id in conf["USER_ORGA"]:
+            if content.startswith("!") and author_id in conf["USER_ORGA"]:
                 requests.delete(f"https://discord.com/api/v10/channels/{target_chan}/messages/{m['id']}", headers=h)
-                if content == "/clean":
+                
+                if content == "!help":
+                    help_msg = (
+                        "**🛠️ RTC-Grabber Steuerung**\n\n"
+                        "`!grids=X` - Fixiert Grids (0 = Auto)\n"
+                        "`!clean` - Manueller Cleanup (News/Lobby/Make)\n"
+                        "`!newevent` - Erzwingt Event-Neustart"
+                    )
+                    send_order_feedback(conf, help_msg)
+                elif content == "!clean":
                     news_cleanup(conf, state.get("active_log_id"))
                     lobby_cleanup(conf)
                     force_reset = True
-                elif content == "/newevent":
+                elif content == "!newevent":
                     force_reset = True
-                elif content.startswith("/grids="):
+                elif content.startswith("!grids="):
                     try:
                         val = int(content.split("=")[1])
                         state["manual_grids"] = val if val > 0 else None
                         if val == 0: state["frozen_grids"] = None
                         save_state(state)
-                        send_order_feedback(conf, f"🔒 Grids manuell auf `{val}` gesetzt.")
+                        send_order_feedback(conf, f"🔒 Grids auf `{val}` fixiert.")
                     except: pass
     return force_reset
 
@@ -166,7 +175,8 @@ def home():
             news_cleanup(conf, target_log_id)
             lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-            with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} Event gestartet\n")
+            with open(LOG_FILE, "w", encoding="utf-8") as f: 
+                f.write(f"{format_ts_short(now)} Event gestartet\n")
             if conf["MAKE_WEBHOOK"]:
                 requests.post(conf["MAKE_WEBHOOK"], json={"type": "event_reset", "event_title": event_title})
             state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": now.isoformat(), "sun_msg_sent": False, "extra_msg_sent": False, "manual_grids": None, "frozen_grids": None, "active_log_id": target_log_id}
@@ -201,7 +211,7 @@ def home():
                 new_id = new_log.json()['id']
                 state["active_log_id"] = new_id
                 save_state(state)
-                send_order_feedback(conf, f"🆕 Neues Log erstellt! ID: `{new_id}` (Bitte in Render eintragen!)")
+                send_order_feedback(conf, f"🆕 Log erstellt! ID: `{new_id}`")
         else:
             requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{target_log_id}", 
                            headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
@@ -212,24 +222,28 @@ def home():
     except Exception as e: return f"Error: {str(e)}", 500
 
 def render_dashboard(state, count, grids, is_final, is_locked, cap):
-    log_entries = read_persistent_log()[-15:]
-    log_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:2px;'>{l}</div>" for l in reversed(log_entries)])
+    # Letzte 50 Änderungen lesen und umkehren (neueste oben)
+    log_entries = read_persistent_log()[-50:]
+    log_html = "".join([f"<div style='border-bottom:1px solid #333; padding:4px 2px;'>{l}</div>" for l in reversed(log_entries)])
     s_col = "#4CAF50"
     ov_tag = " <span style='color:red;'>🔒</span>" if is_locked else ""
     return f"""
     <html><head><title>Apollo Monitor</title><meta http-equiv="refresh" content="30"></head>
     <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
-        <div style="max-width:800px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
-            <h2 style="margin-top:0;">🏁 Apollo Event Monitor V109</h2>
-            <div style="padding:15px; background:#fafafa; border-left:5px solid {s_col}; margin-bottom:20px;">
+        <div style="max-width:900px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="margin-top:0;">🏁 Apollo Monitor V112</h2>
+            <div style="padding:12px; background:#eee; border-radius:5px; margin-bottom:15px; font-size:1em;">
                 <b>Event:</b> {state.get('event_title', 'Unbekannt')}
             </div>
-            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:20px; text-align:center;">
-                <div style="background:#e3f2fd; padding:15px; border-radius:8px;">Fahrer: <b>{count}</b></div>
-                <div style="background:#e8f5e9; padding:15px; border-radius:8px;">Grids: <b>{grids}{ov_tag}</b></div>
-                <div style="background:#fff3e0; padding:15px; border-radius:8px;">Log-ID: <b style="font-size:0.7em;">{state.get('active_log_id','--')}</b></div>
+            <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; text-align:center; margin-bottom:20px;">
+                <div style="background:#e3f2fd; padding:15px; border-radius:8px; border:1px solid #bbdefb;">Fahrer: <br><b style="font-size:1.4em;">{count}</b></div>
+                <div style="background:#e8f5e9; padding:15px; border-radius:8px; border:1px solid #c8e6c9;">Grids: <br><b style="font-size:1.4em;">{grids}{ov_tag}</b></div>
+                <div style="background:#fff3e0; padding:15px; border-radius:8px; border:1px solid #ffe0b2; font-size:0.75em;">Log-ID:<br>{state.get('active_log_id','--')}</div>
             </div>
-            <div style="background:#1e1e1e; color:#d4d4d4; padding:15px; border-radius:8px; font-family:monospace; height:250px; overflow-y:auto;">{log_html}</div>
+            <div style="background:#1e1e1e; color:#00ff00; padding:15px; border-radius:8px; font-family:'Courier New', monospace; height:450px; overflow-y:auto; border:2px solid #333; line-height:1.4;">
+                <div style="color:#aaa; border-bottom:1px solid #444; padding-bottom:5px; margin-bottom:10px; font-size:0.8em; text-transform:uppercase;">Letzte 50 Aktivitäten (Neueste zuerst):</div>
+                {log_html}
+            </div>
         </div></body></html>"""
 
 if __name__ == "__main__":
