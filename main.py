@@ -12,6 +12,7 @@ def get_env_config():
         "CHAN_LOG": c_id(e.get("CHAN_LOG")),
         "CHAN_NEWS": c_id(e.get("CHAN_NEWS")),
         "CHAN_CODES": c_id(e.get("CHAN_CODES")),
+        "CHAN_ORDERS": c_id(e.get("CHAN_ORDERS")), # Neuer Kanal für Befehle
         "MAKE_WEBHOOK": e.get("MAKE_WEBHOOK_URL"),
         "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
@@ -60,11 +61,17 @@ def read_persistent_log():
     with LOG_LOCK:
         with open(LOG_FILE, "r", encoding="utf-8") as f: return [l.strip() for l in f if l.strip()]
 
+def send_order_feedback(conf, text):
+    if not conf["CHAN_ORDERS"]: return
+    requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_ORDERS']}/messages", 
+                  headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
+
 # --- DISCORD COMMANDS LOGIK ---
 def process_discord_commands(conf, state):
-    if not conf["CHAN_LOG"]: return ""
+    target_chan = conf["CHAN_ORDERS"] or conf["CHAN_LOG"]
+    if not target_chan: return ""
     h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
-    url = f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages?limit=10"
+    url = f"https://discord.com/api/v10/channels/{target_chan}/messages?limit=10"
     res = requests.get(url, headers=h)
     test_output = ""
     if res.ok:
@@ -72,24 +79,38 @@ def process_discord_commands(conf, state):
             content = m.get("content", "").strip().lower()
             author_id = str(m.get("author", {}).get("id"))
             if content.startswith("/") and author_id in conf["USER_ORGA"]:
-                # Kommando sofort löschen
-                requests.delete(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{m['id']}", headers=h)
+                requests.delete(f"https://discord.com/api/v10/channels/{target_chan}/messages/{m['id']}", headers=h)
                 
-                if content == "/clean":
+                if content == "/help":
+                    help_text = (
+                        "**🛠️ Bot-Steuerung Hilfe**\n\n"
+                        "`/grids=X` - Setzt die Grid-Anzahl fest (0 zum Entsperren).\n"
+                        "`/clean` - Löscht Bot-News, Lobby-Codes und triggert Make-Cleanup.\n"
+                        "`/newevent` - Erzwingt die Erkennung eines neuen Events.\n"
+                        "`/test` - Prüft die Befehlserkennung im Dashboard."
+                    )
+                    send_order_feedback(conf, help_text)
+                elif content == "/clean":
                     news_cleanup(conf)
                     lobby_cleanup(conf)
+                    if conf["MAKE_WEBHOOK"]:
+                        requests.post(conf["MAKE_WEBHOOK"], json={"type": "event_reset", "timestamp": get_now().isoformat()})
+                    send_order_feedback(conf, "✅ **Säuberung durchgeführt:** News-Kanal, Lobby-Codes und Make-Tabelle wurden zurückgesetzt.")
                 elif content == "/newevent":
                     state["event_id"] = None
                     save_state(state)
+                    send_order_feedback(conf, "🔄 **Event-Reset:** Das aktuelle Apollo-Event wird beim nächsten Scan als neues Event initialisiert.")
                 elif content.startswith("/grids="):
                     try:
                         val = int(content.split("=")[1])
                         state["manual_grids"] = val if val > 0 else None
                         if val == 0: state["frozen_grids"] = None
                         save_state(state)
+                        msg = f"🔒 **Grid-Lock:** Es wurden fest `{val}` Grids für dieses Event definiert." if val > 0 else "🔓 **Grid-Lock:** Die automatische Berechnung wurde wieder aktiviert."
+                        send_order_feedback(conf, msg)
                     except: pass
                 elif content == "/test":
-                    test_output = "SIMULATION: Befehlserkennung erfolgreich."
+                    test_output = "Befehlserkennung: OK"
     return test_output
 
 # --- CLEANUP FEATURES ---
@@ -132,7 +153,6 @@ def home():
         event_title = embed.get("title", "Event")
         is_new = (state["event_id"] is None or state["event_id"] != apollo_msg["id"])
         
-# --- RESET BEI NEUEM EVENT (V103) ---
         if is_new:
             if now.weekday() == 1 or state["event_id"] is None:
                 news_cleanup(conf)
@@ -142,14 +162,8 @@ def home():
             with open(LOG_FILE, "w", encoding="utf-8") as f: 
                 f.write(f"{format_ts_short(now)} Event gestartet\n")
             
-            # Webhook an Make für Tabellen-Reset
             if conf["MAKE_WEBHOOK"]:
-                payload = {
-                    "type": "event_reset", 
-                    "event_title": event_title,
-                    "timestamp": now.isoformat()
-                }
-                requests.post(conf["MAKE_WEBHOOK"], json=payload)
+                requests.post(conf["MAKE_WEBHOOK"], json={"type": "event_reset", "event_title": event_title, "timestamp": now.isoformat()})
 
             state = {
                 "event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], 
