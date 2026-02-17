@@ -36,13 +36,11 @@ app = Flask(__name__)
 # BLOCK 2: HILFSFUNKTIONEN
 # ==============================================================================
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
-
 def format_ts_short(dt_obj):
     days = {"Mon":"Mo", "Tue":"Di", "Wed":"Mi", "Thu":"Do", "Fri":"Fr", "Sat":"Sa", "Sun":"So"}
     raw = dt_obj.strftime("%a %H:%M")
     for en, de in days.items(): raw = raw.replace(en, de)
     return raw
-
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
 
@@ -70,7 +68,7 @@ def get_bot_user_id(token):
     return None
 
 # ==============================================================================
-# BLOCK 3: NEWS-SYSTEM
+# BLOCK 3: NEWS-SYSTEM (Zweisprachig)
 # ==============================================================================
 def send_combined_news(conf, key_base, **kwargs):
     if not conf["CHAN_NEWS"]: return
@@ -80,8 +78,10 @@ def send_combined_news(conf, key_base, **kwargs):
     def pick(t):
         opts = [o.strip() for o in t.split(";") if o.strip()]
         return random.choice(opts) if opts else t
+
     full_text = f"🇩🇪 {pick(msg_de).format(**kwargs)}"
-    if msg_en: full_text += f"\n\n🇬🇧 {pick(msg_en).format(**kwargs)}"
+    if msg_en:
+        full_text += f"\n\n🇬🇧 {pick(msg_en).format(**kwargs)}"
     requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages", 
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": full_text})
 
@@ -116,7 +116,7 @@ def lobby_cleanup(conf):
     if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
 # ==============================================================================
-# BLOCK 5: COMMANDS
+# BLOCK 5: COMMANDS (Mit Namensnennung)
 # ==============================================================================
 def process_discord_commands(conf, state):
     target_chan = conf["CHAN_ORDERS"] or conf["CHAN_LOG"]
@@ -137,13 +137,7 @@ def process_discord_commands(conf, state):
                 requests.delete(f"https://discord.com/api/v10/channels/{target_chan}/messages/{m['id']}", headers=h)
                 
                 if content == "!help":
-                    help_msg = (
-                        f"**🛠️ RTC Apollo Grabber V2 - Befehlsübersicht** (Aufruf durch {user_name})\n\n"
-                        "`!grids=X` : Setzt die Gridanzahl manuell fest (z.B. `!grids=3`).\n"
-                        "`!clean`   : KOMPLETTER RESET. Löscht Logs und State (wie Deploy).\n"
-                        "`!sync`    : Erzwingt sofortige Übertragung an Make.com.\n"
-                        "`!newevent`: Startet das Protokoll für das aktuelle Event neu."
-                    )
+                    help_msg = (f"**🛠️ RTC Apollo Grabber V2** (von {user_name})\n`!grids=X`, `!clean`, `!sync`, `!newevent`")
                     send_order_feedback(conf, help_msg)
                 elif content == "!clean":
                     news_cleanup(conf)
@@ -154,7 +148,7 @@ def process_discord_commands(conf, state):
                     send_order_feedback(conf, f"🧹 **Kaltstart:** {user_name} hat alle Daten gelöscht.")
                 elif content == "!sync":
                     force_sync = True
-                    send_order_feedback(conf, f"🔄 **Sync:** {user_name} hat Übertragung ausgelöst.")
+                    send_order_feedback(conf, f"🔄 **Sync:** {user_name} hat die Übertragung ausgelöst.")
                 elif content == "!newevent":
                     force_reset = True
                     send_order_feedback(conf, f"🔄 **Reset:** {user_name} hat einen Reset erzwungen.")
@@ -163,7 +157,8 @@ def process_discord_commands(conf, state):
                         val = int(content.split("=")[1])
                         state["manual_grids"] = None if val == 0 else min(val, conf["MAX_GRIDS"])
                         save_state(state)
-                        send_order_feedback(conf, f"🔒 **Grids:** Auf {state['manual_grids'] or 'Auto'} gesetzt.")
+                        status_txt = f"{state['manual_grids']} Grids" if state['manual_grids'] else "Automatik"
+                        send_order_feedback(conf, f"🔒 **Grids:** {user_name} hat auf `{status_txt}` gesetzt.")
                     except: pass
     return force_reset, force_sync
 
@@ -173,22 +168,19 @@ def send_order_feedback(conf, text):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 # ==============================================================================
-# BLOCK 6: HAUPT-LOGIK
+# BLOCK 6: HAUPT-LOGIK (V132 - Zweisprachig & Fixes)
 # ==============================================================================
 @app.route('/')
 def home():
     conf = get_env_config()
     state = load_state()
     now = get_now()
-    
-    is_tuesday = (now.weekday() == 1 and now.hour == 9 and now.minute == 59)
     force_reset, force_sync = process_discord_commands(conf, state)
     
-    # Echter Reset wie nach Deploy
     if force_reset:
         state = {"event_id": None, "drivers": [], "last_make_sync": None, "event_title": "Unbekannt", "manual_grids": None, "active_log_id": state.get("active_log_id"), "last_cap": 0}
 
-    should_reset_data = is_tuesday or force_reset
+    should_reset_data = (now.weekday() == 1 and now.hour == 9 and now.minute == 59) or force_reset
 
     try:
         api_url = f"https://discord.com/api/v10/channels/{conf['CHAN_APOLLO']}/messages?limit=10"
@@ -199,14 +191,10 @@ def home():
         embed = apollo_msg["embeds"][0]
         event_title = embed.get("title", "Event")
 
-        # Log-Datei Check
         if should_reset_data or not os.path.exists(LOG_FILE):
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-            with open(LOG_FILE, "w", encoding="utf-8") as f: 
-                f.write(f"{format_ts_short(now)} Event gestartet\n")
-            state["event_id"] = apollo_msg["id"]
-            state["event_title"] = event_title
-            state["drivers"] = []
+            with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} Event gestartet\n")
+            state.update({"event_id": apollo_msg["id"], "event_title": event_title, "drivers": []})
             save_state(state)
 
         drivers = []
@@ -216,14 +204,12 @@ def home():
                     c = re.sub(r"^\d+[\s.)-]*", "", line).strip()
                     if c: drivers.append(c)
 
-        count = len(drivers)
+        count, old_drivers = len(drivers), state.get("drivers", [])
         is_locked = state.get("manual_grids") is not None
         grids = state.get("manual_grids") if is_locked else min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
         current_cap = grids * conf["DRIVERS_PER_GRID"]
         
-        old_drivers = state.get("drivers", [])
         new_log_entries = []
-
         if not old_drivers and drivers:
             for d in drivers:
                 idx = drivers.index(d)
@@ -238,8 +224,7 @@ def home():
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
                 if idx >= current_cap and conf["SW_WAIT"]:
                     send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
-            for d in removed:
-                new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
+            for d in removed: new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
 
             old_cap = state.get("last_cap", 0)
             if current_cap != old_cap and old_cap > 0:
@@ -271,50 +256,42 @@ def home():
                 if m_res.ok: state["last_make_sync"] = now.isoformat()
             except: pass
 
-        # --- DISPLAY LOG ---
-        full_log = read_persistent_log()
-        display_log = ""
-        max_chars = 1300
+        full_log, display_log = read_persistent_log(), ""
         for entry in reversed(full_log):
-            if len(display_log) + len(entry) + 5 > max_chars:
+            if len(display_log) + len(entry) + 5 > 1300:
                 display_log = "[...]\n" + display_log
                 break
             display_log = entry + "\n" + display_log
 
         icon_stat, txt_stat = ("🟢", "Anmeldung geöffnet") if count < current_cap else ("🟡", "Warteliste aktiv")
         sync_time = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else "--"
-        grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
-        
-        log_content = (f"**{event_title}**\n{icon_stat} **{txt_stat}**\nFahrer: `{count}` | Grids: `{grid_display}`\n"
+        log_content = (f"**{event_title}**\n{icon_stat} **{txt_stat}**\nFahrer: `{count}` | Grids: `{grids}{' 🔒' if is_locked else ''}`\n"
                        f"```\n{display_log}```\n"
                        f"*Stand: {format_ts_short(now)} | Sync: {sync_time}*")
         
-        active_id = state.get("active_log_id")
-        log_url = f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages"
+        active_id, log_url = state.get("active_log_id"), f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages"
         log_reachable = False
         if active_id:
-            res_check = requests.get(f"{log_url}/{active_id}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"})
-            if res_check.ok: log_reachable = True
+            res_c = requests.get(f"{log_url}/{active_id}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"})
+            if res_c.ok: log_reachable = True
 
         if not log_reachable:
-            new_log = requests.post(log_url, headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
-            if new_log.ok: state["active_log_id"] = new_log.json()['id']
+            new_l = requests.post(log_url, headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
+            if new_l.ok: state["active_log_id"] = new_l.json()['id']
         else:
             requests.patch(f"{log_url}/{active_id}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
 
-        state["drivers"] = drivers
-        state["last_cap"] = current_cap
+        state.update({"drivers": drivers, "last_cap": current_cap})
         save_state(state)
         return render_dashboard(state, count, grids, is_locked)
     except Exception as e: return f"Error: {str(e)}", 500
 
 # ==============================================================================
-# BLOCK 7: DASHBOARD
+# BLOCK 7: DASHBOARD & START
 # ==============================================================================
 def render_dashboard(state, count, grids, is_locked):
     log_entries = read_persistent_log()[-50:]
     log_html = "".join([f"<div style='border-bottom:1px solid #333; padding:4px 2px;'>{l}</div>" for l in reversed(log_entries)])
-    ov_tag = " <span style='color:red;'>🔒</span>" if is_locked else ""
     return f"""<html><head><title>Apollo Grabber V2</title><meta http-equiv="refresh" content="30"></head>
     <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
         <div style="max-width:900px; margin:auto; background:white; padding:20px; border-radius:10px;">
@@ -322,7 +299,7 @@ def render_dashboard(state, count, grids, is_locked):
             <div style="padding:10px; background:#eee; margin-bottom:15px;"><b>Event:</b> {state.get('event_title')}</div>
             <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; text-align:center;">
                 <div style="background:#e3f2fd; padding:10px;">Fahrer: <b>{count}</b></div>
-                <div style="background:#e8f5e9; padding:10px;">Grids: <b>{grids}{ov_tag}</b></div>
+                <div style="background:#e8f5e9; padding:10px;">Grids: <b>{grids}{' 🔒' if is_locked else ''}</b></div>
                 <div style="background:#fff3e0; padding:10px;">ID: {state.get('active_log_id','--')}</div>
             </div>
             <div style="background:#1e1e1e; color:#00ff00; padding:15px; margin-top:20px; height:450px; overflow-y:auto; font-family:monospace;">{log_html}</div>
