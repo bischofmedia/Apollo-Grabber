@@ -1,5 +1,5 @@
-import os, requests, json, re, math, datetime, pytz, threading, time, random
-from flask import Flask, request
+import os, requests, json, re, math, datetime, pytz, threading, time
+from flask import Flask
 
 # ---------- KONFIGURATION ----------
 def get_env_config():
@@ -17,14 +17,7 @@ def get_env_config():
         "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)),
-        "EXTRA_THRESH": int(e.get("EXTRA_GRID_THRESHOLD", 10)),
-        "REG_END_TIME": e.get("REGISTRATION_END_TIME", "20:45").strip(),
         "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
-        "SW_EXTRA": e.get("SET_MSG_EXTRA_GRID_TEXT") == "1",
-        "SW_MOVE": e.get("SET_MSG_MOVED_UP_TEXT") == "1",
-        "SW_SUN": e.get("ENABLE_SUNDAY_MSG") == "1",
-        "SW_WAIT": e.get("ENABLE_WAITLIST_MSG") == "1",
-        "ENABLE_EXTRA": e.get("ENABLE_EXTRA_GRID") == "1",
         "ENABLE_NEWS_CLEAN": e.get("ENABLE_NEWS_CLEANUP") == "1",
         "MSG_LOBBY": e.get("MSG_LOBBYCODES", "")
     }
@@ -58,7 +51,7 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "event_title": "Unbekannt", "manual_grids": None, "frozen_grids": None, "active_log_id": None}
+    return {"event_id": None, "drivers": [], "last_make_sync": None, "event_title": "Unbekannt", "manual_grids": None, "active_log_id": None}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
@@ -74,7 +67,7 @@ def send_order_feedback(conf, text):
     requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_ORDERS']}/messages", 
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
-# --- CLEANUP FEATURES ---
+# --- CLEANUP ---
 def news_cleanup(conf, state_log_id):
     if not conf["ENABLE_NEWS_CLEAN"] or not conf["CHAN_NEWS"]: return
     my_id = get_bot_user_id(conf["TOKEN_APOLLO"])
@@ -83,31 +76,18 @@ def news_cleanup(conf, state_log_id):
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
     
+    # STRIKTER SCHUTZ: ID aus Render und flüchtige ID
     protected = [str(conf["MANUAL_LOG_ID"]), str(state_log_id)]
 
     if res.ok:
         for m in res.json():
             mid = str(m.get("id"))
-            if mid in protected or not mid: continue
+            if mid in protected: continue
             if str(m.get("author", {}).get("id")) == my_id:
                 requests.delete(f"{url}/{mid}", headers=h)
                 time.sleep(0.3)
 
-def lobby_cleanup(conf):
-    if not conf["TOKEN_LOBBY"] or not conf["CHAN_CODES"]: return
-    my_id = get_bot_user_id(conf["TOKEN_LOBBY"])
-    if not my_id: return
-    h = {"Authorization": f"Bot {conf['TOKEN_LOBBY']}"}
-    url = f"https://discord.com/api/v10/channels/{conf['CHAN_CODES']}/messages"
-    res = requests.get(f"{url}?limit=50", headers=h)
-    if res.ok:
-        for m in res.json():
-            if str(m.get("author", {}).get("id")) == my_id:
-                requests.delete(f"{url}/{m['id']}", headers=h)
-        time.sleep(0.2)
-    if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
-
-# --- DISCORD COMMANDS LOGIK ---
+# --- COMMANDS ---
 def process_discord_commands(conf, state):
     target_chan = conf["CHAN_ORDERS"] or conf["CHAN_LOG"]
     if not target_chan: return False
@@ -125,7 +105,6 @@ def process_discord_commands(conf, state):
                     send_order_feedback(conf, "**🛠️ RTC-Grabber**\n`!grids=X`, `!clean`, `!newevent`")
                 elif content == "!clean":
                     news_cleanup(conf, state.get("active_log_id"))
-                    lobby_cleanup(conf)
                     force_reset = True
                 elif content == "!newevent":
                     force_reset = True
@@ -133,7 +112,6 @@ def process_discord_commands(conf, state):
                     try:
                         val = int(content.split("=")[1])
                         state["manual_grids"] = val if val > 0 else None
-                        if val == 0: state["frozen_grids"] = None
                         save_state(state)
                         send_order_feedback(conf, f"🔒 Grids: `{val}`")
                     except: pass
@@ -153,15 +131,13 @@ def home():
                                headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"})
         if res_log.ok: log_exists = True
 
-    is_tuesday_reset = (now.weekday() == 1 and now.hour == 9 and now.minute == 59)
+    is_tuesday = (now.weekday() == 1 and now.hour == 9 and now.minute == 59)
     force_reset = process_discord_commands(conf, state)
-    
-    # KRITISCH: log_exists triggert KEINEN Full-Reset der Daten mehr, nur eine Neuerstellung der Nachricht
-    should_reset_data = is_tuesday_reset or force_reset
+    should_reset_data = is_tuesday or force_reset
 
     try:
         api_url = f"https://discord.com/api/v10/channels/{conf['CHAN_APOLLO']}/messages?limit=10"
-        res = requests.get(api_url, headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, timeout=10)
+        res = requests.get(api_url, headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"})
         apollo_msg = next((m for m in res.json() if m.get("embeds")), None)
         if not apollo_msg: return "Warte auf Apollo..."
         
@@ -170,13 +146,10 @@ def home():
 
         if should_reset_data:
             news_cleanup(conf, target_log_id)
-            lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: 
                 f.write(f"{format_ts_short(now)} Event gestartet\n")
-            if conf["MAKE_WEBHOOK"]:
-                requests.post(conf["MAKE_WEBHOOK"], json={"type": "event_reset", "event_title": event_title})
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": now.isoformat(), "sun_msg_sent": False, "extra_msg_sent": False, "manual_grids": None, "frozen_grids": None, "active_log_id": target_log_id}
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": target_log_id}
             save_state(state)
 
         drivers = []
@@ -187,52 +160,64 @@ def home():
                     if c: drivers.append(c)
 
         count = len(drivers)
-        grids = state.get("manual_grids") or state.get("frozen_grids") or min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
-        current_cap = grids * conf["DRIVERS_PER_GRID"]
+        grids = state.get("manual_grids") or min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
         
         added = [d for d in drivers if d not in state.get("drivers", [])]
         removed = [d for d in state.get("drivers", []) if d not in drivers]
+        
         if (added or removed) and not should_reset_data:
             with LOG_LOCK:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for d in added: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)}\n")
                     for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
-        # LOG NACHRICHT
-        icon, status = ("🟢", "Anmeldung geöffnet")
+        # --- FIX: MAKE SYNC IMMER BEI ÄNDERUNG ---
+        if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data):
+            payload = {
+                "type": "event_reset" if should_reset_data else "update",
+                "driver_count": count,
+                "drivers": [raw_for_make(d) for d in drivers],
+                "grids": grids,
+                "log_history": "\n".join(read_persistent_log()),
+                "timestamp": now.isoformat()
+            }
+            try:
+                m_res = requests.post(conf["MAKE_WEBHOOK"], json=payload, timeout=10)
+                if m_res.ok:
+                    state["last_make_sync"] = now.isoformat()
+            except: pass
+
+        # LOG-NACHRICHT FORMATIERUNG
+        sync_time = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else "--"
         log_content = (
-            f"**{event_title}**\n"
-            f"{icon} **{status}**\n"
+            f"**{event_title}**\n🟢 **Anmeldung geöffnet**\n"
             f"Fahrer: `{count}` | Grids: `{grids}`\n"
             f"```\n" + "\n".join(read_persistent_log()[-15:]) + "```\n"
-            f"*Stand: {format_ts_short(now)} | Sync: {format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else '--'}*"
+            f"*Stand: {format_ts_short(now)} | Sync: {sync_time}*"
         )
         
         if not log_exists:
             new_log = requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages", 
                                    headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
             if new_log.ok:
-                new_id = new_log.json()['id']
-                state["active_log_id"] = new_id
-                save_state(state)
-                send_order_feedback(conf, f"🆕 Neues Log erstellt: `{new_id}`")
+                state["active_log_id"] = new_log.json()['id']
         else:
             requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{target_log_id}", 
                            headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
 
         state["drivers"] = drivers
         save_state(state)
-        return render_dashboard(state, count, grids, False, (state.get("manual_grids") is not None), current_cap)
+        return render_dashboard(state, count, grids)
     except Exception as e: return f"Error: {str(e)}", 500
 
-def render_dashboard(state, count, grids, is_final, is_locked, cap):
+def render_dashboard(state, count, grids):
     log_entries = read_persistent_log()[-50:]
     log_html = "".join([f"<div style='border-bottom:1px solid #333; padding:4px 2px;'>{l}</div>" for l in reversed(log_entries)])
     return f"""
-    <html><head><title>Apollo Grabber V2</title><meta http-equiv="refresh" content="30"></head>
+    <html><head><title>Monitor V115</title><meta http-equiv="refresh" content="30"></head>
     <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
         <div style="max-width:900px; margin:auto; background:white; padding:20px; border-radius:10px;">
-            <h2>🏁 Apollo Grabber V2</h2>
+            <h2>🏁 Monitor V115</h2>
             <div style="padding:10px; background:#eee; margin-bottom:15px;"><b>Event:</b> {state.get('event_title')}</div>
             <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; text-align:center;">
                 <div style="background:#e3f2fd; padding:10px;">Fahrer: <b>{count}</b></div>
