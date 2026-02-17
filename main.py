@@ -13,6 +13,7 @@ def get_env_config():
         "CHAN_NEWS": c_id(e.get("CHAN_NEWS")),
         "CHAN_CODES": c_id(e.get("CHAN_CODES")),
         "MAKE_WEBHOOK": e.get("MAKE_WEBHOOK_URL"),
+        "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)),
         "EXTRA_THRESH": int(e.get("EXTRA_GRID_THRESHOLD", 10)),
@@ -43,18 +44,53 @@ def format_ts_short(dt_obj):
     return raw
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
     return {"event_id": None, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "event_title": "Unbekannt", "manual_grids": None, "frozen_grids": None}
+
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
+
 def read_persistent_log():
     if not os.path.exists(LOG_FILE): return []
     with LOG_LOCK:
         with open(LOG_FILE, "r", encoding="utf-8") as f: return [l.strip() for l in f if l.strip()]
+
+# --- DISCORD COMMANDS LOGIK ---
+def process_discord_commands(conf, state):
+    if not conf["CHAN_LOG"]: return ""
+    h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
+    url = f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages?limit=10"
+    res = requests.get(url, headers=h)
+    test_output = ""
+    if res.ok:
+        for m in res.json():
+            content = m.get("content", "").strip().lower()
+            author_id = str(m.get("author", {}).get("id"))
+            if content.startswith("/") and author_id in conf["USER_ORGA"]:
+                # Kommando sofort löschen
+                requests.delete(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{m['id']}", headers=h)
+                
+                if content == "/clean":
+                    news_cleanup(conf)
+                    lobby_cleanup(conf)
+                elif content == "/newevent":
+                    state["event_id"] = None
+                    save_state(state)
+                elif content.startswith("/grids="):
+                    try:
+                        val = int(content.split("=")[1])
+                        state["manual_grids"] = val if val > 0 else None
+                        if val == 0: state["frozen_grids"] = None
+                        save_state(state)
+                    except: pass
+                elif content == "/test":
+                    test_output = "SIMULATION: Befehlserkennung erfolgreich."
+    return test_output
 
 # --- CLEANUP FEATURES ---
 def news_cleanup(conf):
@@ -64,7 +100,6 @@ def news_cleanup(conf):
     res = requests.get(f"{url}?limit=100", headers=h)
     if res.ok:
         for m in res.json():
-            # Lösche nur Nachrichten, die vom Bot selbst stammen
             if str(m.get("author", {}).get("id")) == APOLLO_BOT_ID:
                 requests.delete(f"{url}/{m['id']}", headers=h)
                 time.sleep(0.2)
@@ -85,14 +120,7 @@ def home():
     conf = get_env_config()
     state = load_state()
     now = get_now()
-    
-    url_grid_param = request.args.get('grids', type=int)
-    if url_grid_param is not None:
-        if url_grid_param == 0:
-            state["manual_grids"], state["frozen_grids"] = None, None
-        else:
-            state["manual_grids"] = url_grid_param
-        save_state(state)
+    test_msg = process_discord_commands(conf, state)
     
     try:
         api_url = f"https://discord.com/api/v10/channels/{conf['CHAN_APOLLO']}/messages?limit=10"
@@ -101,24 +129,34 @@ def home():
         if not apollo_msg: return "Warte auf Apollo..."
 
         embed = apollo_msg["embeds"][0]
-        event_title, drivers = embed.get("title", "Event"), []
+        event_title = embed.get("title", "Event")
+        is_new = (state["event_id"] is None or state["event_id"] != apollo_msg["id"])
+        
+        # --- RESET BEI NEUEM EVENT ---
+        if is_new:
+            if now.weekday() == 1 or state["event_id"] is None:
+                news_cleanup(conf)
+                lobby_cleanup(conf)
+            
+            if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+            with open(LOG_FILE, "w", encoding="utf-8") as f: 
+                f.write(f"{format_ts_short(now)} Event gestartet\n")
+            
+            state = {
+                "event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], 
+                "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, 
+                "manual_grids": None, "frozen_grids": None
+            }
+            save_state(state)
+            return render_dashboard(state, 0, 0, False, False, 0, test_msg)
+
+        # --- NORMALE VERARBEITUNG ---
+        drivers = []
         for f in embed.get("fields", []):
             if any(k in f.get("name", "").lower() for k in ["accepted", "confirmed", "anmeldung"]):
                 for line in f.get("value", "").split("\n"):
                     c = re.sub(r"^\d+[\s.)-]*", "", line).strip()
                     if c: drivers.append(c)
-
-        is_new = (state.get("event_id") and state["event_id"] != apollo_msg["id"])
-        
-        # --- DIENSTAGS-CLEANUP BEI EVENTWECHSEL ---
-        if is_new:
-            if now.weekday() == 1: # 1 = Dienstag
-                news_cleanup(conf)
-                lobby_cleanup(conf)
-            
-            if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-            with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} ✨ Event: {event_title}\n")
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, "manual_grids": None, "frozen_grids": None}
 
         is_sun_18 = (now.weekday() == 6 and now.hour >= 18)
         is_final_lock = False
@@ -167,7 +205,11 @@ def home():
                         idx = drivers.index(d)
                         icon = "🟡" if idx >= current_cap else "🟢"
                         f.write(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}\n")
-                    for d in moved_up: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)} (Nachgerückt)\n")
+                        if idx >= current_cap and conf["SW_WAIT"]:
+                            send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
+                    for d in moved_up:
+                        f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)} (Nachgerückt)\n")
+                        if conf["SW_MOVE"]: send_combined_news(conf, "MSG_MOVED_UP_SINGLE", driver_names=clean_for_log(d))
                     for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
         if conf["SW_SUN"] and is_sun_18 and not state.get("sun_msg_sent"):
@@ -176,27 +218,27 @@ def home():
             state["sun_msg_sent"] = True
 
         if conf["MAKE_WEBHOOK"] and (added or removed or is_new):
-            payload = {"type": "event_reset" if is_new else "update", "driver_count": count, "drivers": [raw_for_make(d) for d in drivers], "grids": grids, "log_history": "\n".join(read_persistent_log()), "timestamp": now.isoformat()}
+            payload = {"type": "update", "driver_count": count, "drivers": [raw_for_make(d) for d in drivers], "grids": grids, "log_history": "\n".join(read_persistent_log()), "timestamp": now.isoformat()}
             requests.post(conf["MAKE_WEBHOOK"], json=payload)
             state["last_make_sync"] = now.isoformat()
 
         send_or_edit_log(conf, state, count, grids, is_final_lock, is_locked, current_cap)
         state["drivers"] = drivers
         save_state(state)
-        
-        return render_dashboard(state, count, grids, is_final_lock, is_locked, current_cap)
+        return render_dashboard(state, count, grids, is_final_lock, is_locked, current_cap, test_msg)
     except Exception as e: return f"Error: {str(e)}", 500
 
-def render_dashboard(state, count, grids, is_final, is_locked, cap):
+def render_dashboard(state, count, grids, is_final, is_locked, cap, test_msg=""):
     log_entries = read_persistent_log()[-20:]
     log_html = "".join([f"<div style='border-bottom:1px solid #eee; padding:2px;'>{l}</div>" for l in reversed(log_entries)])
     s_txt, s_col = ("GESCHLOSSEN", "#f44336") if is_final else (("WARTELISTE", "#ff9800") if count >= cap else ("OFFEN", "#4CAF50"))
     ov_tag = " <span style='font-size:0.6em; color:red;'>(LOCK 🔒)</span>" if is_locked else ""
+    t_msg = f"<div style='background:yellow; padding:5px; margin-bottom:10px;'>{test_msg}</div>" if test_msg else ""
     return f"""
     <html><head><title>Apollo Monitor</title><meta http-equiv="refresh" content="30"></head>
     <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
         <div style="max-width:800px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
-            <h2 style="margin-top:0;">🏁 Apollo Event Monitor</h2>
+            {t_msg}<h2 style="margin-top:0;">🏁 Apollo Event Monitor</h2>
             <div style="padding:15px; background:#fafafa; border-left:5px solid {s_col}; margin-bottom:20px;">
                 <b>Event:</b> {state.get('event_title', 'Unbekannt')} | <span style="color:{s_col}; font-weight:bold;">● {s_txt}</span>
             </div>
@@ -206,13 +248,11 @@ def render_dashboard(state, count, grids, is_final, is_locked, cap):
                 <div style="background:#fff3e0; padding:15px; border-radius:8px;">Sync: <br><b>{state.get('last_make_sync','--').split('T')[-1][:5]}</b></div>
             </div>
             <div style="background:#1e1e1e; color:#d4d4d4; padding:15px; border-radius:8px; font-family:monospace; font-size:0.9em; height:300px; overflow-y:auto;">{log_html}</div>
-        </div></body></html>
-    """
+        </div></body></html>"""
 
 def send_combined_news(conf, key_base, **kwargs):
     if not conf["CHAN_NEWS"]: return
-    msg_de = os.environ.get(key_base, "")
-    msg_en = os.environ.get(key_base + "_EN", "")
+    msg_de, msg_en = os.environ.get(key_base, ""), os.environ.get(key_base + "_EN", "")
     if not msg_de: return
     def pick(t):
         opts = [o.strip() for o in t.split(";") if o.strip()]
@@ -227,7 +267,7 @@ def send_or_edit_log(conf, state, count, grids, is_final, is_locked, cap):
     icon, status = ("🔴", "Anmeldung geschlossen") if is_final else (("🟡", "Warteliste aktiv") if count >= cap else ("🟢", "Anmeldung geöffnet"))
     sync_ts = format_ts_short(datetime.datetime.fromisoformat(state["last_make_sync"]).astimezone(BERLIN_TZ)) if state.get("last_make_sync") else "--"
     grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
-    content = (f"{icon} **{status}**\nFahrer: `{count}` | Grids: `{grid_display}`\n\n"
+    content = (f"**{state.get('event_title', 'Event')}**\n{icon} **{status}**\nFahrer: `{count}` | Grids: `{grid_display}`\n\n"
                f"```\n" + "\n".join(read_persistent_log()[-15:]) + "```\n"
                f"*Stand: {format_ts_short(get_now())}* | *Sync: {sync_ts}*")
     requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{conf['MANUAL_LOG_ID']}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": content})
