@@ -76,17 +76,22 @@ def send_order_feedback(conf, text):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 # --- CLEANUP FEATURES ---
-def news_cleanup(conf, current_log_id):
+def news_cleanup(conf, state_log_id):
     if not conf["ENABLE_NEWS_CLEAN"] or not conf["CHAN_NEWS"]: return
     my_id = get_bot_user_id(conf["TOKEN_APOLLO"])
     if not my_id: return
     h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
+    
+    # IDs die NIEMALS gelöscht werden dürfen
+    protected_ids = [str(conf["MANUAL_LOG_ID"]), str(state_log_id)]
+
     if res.ok:
         for m in res.json():
             mid = str(m.get("id"))
-            if mid == conf["MANUAL_LOG_ID"] or mid == current_log_id: continue
+            if mid in protected_ids: 
+                continue # Überspringen
             if str(m.get("author", {}).get("id")) == my_id:
                 requests.delete(f"{url}/{mid}", headers=h)
                 time.sleep(0.3)
@@ -201,8 +206,15 @@ def home():
                     for d in added: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)}\n")
                     for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
 
+        # LOG CONTENT MIT STAND & SYNC
         icon, status = ("🟢", "Anmeldung geöffnet")
-        log_content = f"**{event_title}**\n{icon} **{status}**\nFahrer: `{count}` | Grids: `{grids}`\n\n```\n" + "\n".join(read_persistent_log()[-15:]) + "```"
+        log_content = (
+            f"**{event_title}**\n"
+            f"{icon} **{status}**\n"
+            f"Fahrer: `{count}` | Grids: `{grids}`\n"
+            f"Stand: {format_ts_short(now)} | Sync: {format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state['last_make_sync'] else '--'}\n\n"
+            f"```\n" + "\n".join(read_persistent_log()[-15:]) + "```"
+        )
         
         if not log_exists:
             new_log = requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages", 
@@ -211,7 +223,6 @@ def home():
                 new_id = new_log.json()['id']
                 state["active_log_id"] = new_id
                 save_state(state)
-                send_order_feedback(conf, f"🆕 Log erstellt! ID: `{new_id}`")
         else:
             requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{target_log_id}", 
                            headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
@@ -222,7 +233,6 @@ def home():
     except Exception as e: return f"Error: {str(e)}", 500
 
 def render_dashboard(state, count, grids, is_final, is_locked, cap):
-    # Letzte 50 Änderungen lesen und umkehren (neueste oben)
     log_entries = read_persistent_log()[-50:]
     log_html = "".join([f"<div style='border-bottom:1px solid #333; padding:4px 2px;'>{l}</div>" for l in reversed(log_entries)])
     s_col = "#4CAF50"
@@ -231,7 +241,7 @@ def render_dashboard(state, count, grids, is_final, is_locked, cap):
     <html><head><title>Apollo Monitor</title><meta http-equiv="refresh" content="30"></head>
     <body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
         <div style="max-width:900px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,0.1);">
-            <h2 style="margin-top:0;">🏁 Apollo Monitor V112</h2>
+            <h2 style="margin-top:0;">🏁 Apollo Monitor V113</h2>
             <div style="padding:12px; background:#eee; border-radius:5px; margin-bottom:15px; font-size:1em;">
                 <b>Event:</b> {state.get('event_title', 'Unbekannt')}
             </div>
