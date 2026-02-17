@@ -2,7 +2,7 @@ import os, requests, json, re, math, datetime, pytz, threading, time, random
 from flask import Flask
 
 # ==============================================================================
-# BLOCK 1: KONFIGURATION
+# BLOCK 1: KONFIGURATION & URL-CLEANING
 # ==============================================================================
 def get_env_config():
     def c_id(v): return re.sub(r'[^0-9]', '', str(v)) if v else ""
@@ -68,13 +68,15 @@ def get_bot_user_id(token):
     return None
 
 # ==============================================================================
-# BLOCK 3: NEWS-SYSTEM (Zweisprachig)
+# BLOCK 3: NEWS-SYSTEM (Zweisprachig - Suffix _EN Fix)
 # ==============================================================================
 def send_combined_news(conf, key_base, **kwargs):
     if not conf["CHAN_NEWS"]: return
     msg_de = os.environ.get(key_base, "")
-    msg_en = os.environ.get(key_base.replace("MSG_", "MSG_EN_"), "")
+    # Korrektur: Nutzt Suffix _EN statt Präfix
+    msg_en = os.environ.get(f"{key_base}_EN", "")
     if not msg_de: return
+    
     def pick(t):
         opts = [o.strip() for o in t.split(";") if o.strip()]
         return random.choice(opts) if opts else t
@@ -82,6 +84,7 @@ def send_combined_news(conf, key_base, **kwargs):
     full_text = f"🇩🇪 {pick(msg_de).format(**kwargs)}"
     if msg_en:
         full_text += f"\n\n🇬🇧 {pick(msg_en).format(**kwargs)}"
+    
     requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages", 
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": full_text})
 
@@ -116,7 +119,7 @@ def lobby_cleanup(conf):
     if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
 # ==============================================================================
-# BLOCK 5: COMMANDS (Namensnennung & ID-Rettung)
+# BLOCK 5: COMMANDS (Mit Namensnennung & ID-Rettung)
 # ==============================================================================
 def process_discord_commands(conf, state):
     target_chan = conf["CHAN_ORDERS"] or conf["CHAN_LOG"]
@@ -145,6 +148,7 @@ def process_discord_commands(conf, state):
                     if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
                     if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
                     force_reset = True
+                    send_order_feedback(conf, f"🧹 **Kaltstart:** {user_name} hat alle Daten gelöscht.")
                 elif content == "!sync":
                     force_sync = True
                     send_order_feedback(conf, f"🔄 **Sync:** {user_name} hat die Übertragung ausgelöst.")
@@ -167,7 +171,7 @@ def send_order_feedback(conf, text):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 # ==============================================================================
-# BLOCK 6: HAUPT-LOGIK (V134 - Zweisprachigkeit FIX)
+# BLOCK 6: HAUPT-LOGIK (V137 - Suffix _EN FIX & Delta-Handling)
 # ==============================================================================
 @app.route('/')
 def home():
