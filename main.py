@@ -16,7 +16,7 @@ def get_env_config():
         "MAKE_WEBHOOK": e.get("MAKE_WEBHOOK_URL"),
         "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
-        "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)), # Hier ist die Grenze hinterlegt
+        "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)),
         "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
         "ENABLE_NEWS_CLEAN": e.get("ENABLE_NEWS_CLEANUP") == "1",
         "MSG_LOBBY": e.get("MSG_LOBBYCODES", "")
@@ -51,7 +51,7 @@ def load_state():
         try:
             with open(STATE_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"event_id": None, "drivers": [], "last_make_sync": None, "event_title": "Unbekannt", "manual_grids": None, "active_log_id": None}
+    return {"event_id": None, "drivers": [], "last_make_sync": None, "event_title": "Unbekannt", "manual_grids": None, "active_log_id": None, "last_cap": 0}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f: json.dump(s, f)
@@ -98,40 +98,34 @@ def process_discord_commands(conf, state):
             author_id = str(m.get("author", {}).get("id"))
             if content.startswith("!") and author_id in conf["USER_ORGA"]:
                 requests.delete(f"https://discord.com/api/v10/channels/{target_chan}/messages/{m['id']}", headers=h)
-                
                 if content == "!help":
                     help_msg = (
                         "**🛠️ RTC Apollo Grabber V2 - Befehlsübersicht**\n\n"
-                        "`!grids=X` : Setzt die Gridanzahl manuell fest (z.B. `!grids=3`).\n"
-                        "            *Hinweis: `!grids=0` hebt die Sperre auf und aktiviert die Automatik.*\n"
-                        "`!clean`   : Löscht eigene Nachrichten im News-Kanal, bereinigt die Lobby-Codes und setzt die Make.com-Tabelle zurück.\n"
-                        "`!newevent`: Erzwingt einen Reset und startet die Protokollierung für das aktuelle Apollo-Event neu."
+                        "`!grids=X` : Setzt die Gridanzahl manuell fest.\n"
+                        "            *`!grids=0` aktiviert wieder die Automatik.*\n"
+                        "`!clean`   : Säubert News & Lobby-Codes, triggert Make-Reset.\n"
+                        "`!newevent`: Startet das Protokoll für ein neues Event."
                     )
                     send_order_feedback(conf, help_msg)
-                
                 elif content == "!clean":
                     news_cleanup(conf, state.get("active_log_id"))
                     force_reset = True
-                    send_order_feedback(conf, "🧹 **Manuelle Säuberung:** Eigene News-Beiträge werden entfernt, Lobby-Codes bereinigt und Make.com für den Tabellen-Reset getriggert.")
-                
+                    send_order_feedback(conf, "🧹 **Manuelle Säuberung durchgeführt.**")
                 elif content == "!newevent":
                     force_reset = True
-                    send_order_feedback(conf, "🔄 **Manueller Event-Neustart:** Die bisherigen Fahrerdaten und das Log wurden zurückgesetzt. Ein neues Event-Protokoll wird initialisiert.")
-                
+                    send_order_feedback(conf, "🔄 **Event-Neustart erzwungen.**")
                 elif content.startswith("!grids="):
                     try:
                         val = int(content.split("=")[1])
                         if val == 0:
                             state["manual_grids"] = None
-                            save_state(state)
-                            send_order_feedback(conf, "🔓 **Grid-Sperre aufgehoben:** Die Anzahl der Grids wird nun wieder automatisch berechnet.")
+                            send_order_feedback(conf, "🔓 **Grid-Sperre aufgehoben.**")
                         else:
-                            # Berücksichtigung von MAX_GRIDS
                             final_val = min(val, conf["MAX_GRIDS"])
                             state["manual_grids"] = final_val
-                            save_state(state)
-                            limit_info = f" (begrenzt auf das Maximum von {conf['MAX_GRIDS']})" if val > conf["MAX_GRIDS"] else ""
-                            send_order_feedback(conf, f"🔒 **Grid-Sperre aktiv:** Die Anzahl wurde fest auf `{final_val}` Grids gesetzt{limit_info}.")
+                            limit_info = f" (begrenzt auf {conf['MAX_GRIDS']})" if val > conf["MAX_GRIDS"] else ""
+                            send_order_feedback(conf, f"🔒 **Grid-Sperre aktiv:** `{final_val}` Grids{limit_info}.")
+                        save_state(state)
                     except: pass
     return force_reset
 
@@ -167,7 +161,7 @@ def home():
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: 
                 f.write(f"{format_ts_short(now)} Event gestartet\n")
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": target_log_id}
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": target_log_id, "last_cap": 0}
             save_state(state)
 
         drivers = []
@@ -180,17 +174,35 @@ def home():
         count = len(drivers)
         is_locked = state.get("manual_grids") is not None
         grids = state.get("manual_grids") if is_locked else min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
+        current_cap = grids * conf["DRIVERS_PER_GRID"]
         
+        # Log-Historie für Fahrerwechsel
         added = [d for d in drivers if d not in state.get("drivers", [])]
         removed = [d for d in state.get("drivers", []) if d not in drivers]
         
-        if (added or removed) and not should_reset_data:
+        new_log_entries = []
+        if not should_reset_data:
+            for d in added: new_log_entries.append(f"{format_ts_short(now)} 🟢 {clean_for_log(d)}")
+            for d in removed: new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
+
+            # NEU: Kapazitätsprüfung für Warteliste/Nachrücker bei Grid-Änderung
+            old_cap = state.get("last_cap", 0)
+            if current_cap != old_cap and old_cap > 0:
+                if current_cap < old_cap: # Weniger Grids -> Leute rutschen auf Warteliste
+                    for i, d in enumerate(drivers):
+                        if current_cap <= i < old_cap:
+                            new_log_entries.append(f"{format_ts_short(now)} 🟠 Warteliste: {clean_for_log(d)}")
+                else: # Mehr Grids -> Leute rücken nach
+                    for i, d in enumerate(drivers):
+                        if old_cap <= i < current_cap:
+                            new_log_entries.append(f"{format_ts_short(now)} 🔵 Nachgerückt: {clean_for_log(d)}")
+
+        if new_log_entries:
             with LOG_LOCK:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
-                    for d in added: f.write(f"{format_ts_short(now)} 🟢 {clean_for_log(d)}\n")
-                    for d in removed: f.write(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}\n")
+                    for entry in new_log_entries: f.write(entry + "\n")
 
-        if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data):
+        if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data or current_cap != state.get("last_cap")):
             payload = {
                 "type": "event_reset" if should_reset_data else "update",
                 "driver_count": count,
@@ -201,8 +213,7 @@ def home():
             }
             try:
                 m_res = requests.post(conf["MAKE_WEBHOOK"], json=payload, timeout=10)
-                if m_res.ok:
-                    state["last_make_sync"] = now.isoformat()
+                if m_res.ok: state["last_make_sync"] = now.isoformat()
             except: pass
 
         sync_time = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else "--"
@@ -218,13 +229,13 @@ def home():
         if not log_exists:
             new_log = requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages", 
                                    headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
-            if new_log.ok:
-                state["active_log_id"] = new_log.json()['id']
+            if new_log.ok: state["active_log_id"] = new_log.json()['id']
         else:
             requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{target_log_id}", 
                            headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
 
         state["drivers"] = drivers
+        state["last_cap"] = current_cap
         save_state(state)
         return render_dashboard(state, count, grids, is_locked)
     except Exception as e: return f"Error: {str(e)}", 500
