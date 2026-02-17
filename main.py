@@ -3,10 +3,22 @@ import json
 import asyncio
 import aiohttp
 import datetime
-import random
-import re
+import threading
+import time
+from flask import Flask
 
-# --- KONFIGURATION (Umgebungsvariablen) ---
+# --- BLOCK 1 & 12: KONFIGURATION & FLASK ---
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Apollo Grabber V2 is Live!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Umgebungsvariablen laden
 TOKEN_APOLLO = os.getenv("DISCORD_TOKEN_APOLLOGRABBER")
 TOKEN_LOBBY = os.getenv("DISCORD_TOKEN_LOBBYCODEGRABBER")
 USER_ID_ORGA = os.getenv("USER_ID_ORGA", "").split(";")
@@ -20,14 +32,8 @@ MAKE_WEBHOOK = os.getenv("MAKE_WEBHOOK_URL")
 DRIVERS_PER_GRID = int(os.getenv("DRIVERS_PER_GRID", 15))
 MAX_GRIDS = int(os.getenv("MAX_GRIDS", 4))
 REG_END_TIME = os.getenv("REGISTRATION_END_TIME", "20:00")
-
-# News Schalter
-ENABLE_NEWS_CLEANUP = os.getenv("ENABLE_NEWS_CLEANUP") == "1"
-ENABLE_WAITLIST_MSG = os.getenv("ENABLE_WAITLIST_MSG") == "1"
-ENABLE_SUNDAY_MSG = os.getenv("ENABLE_SUNDAY_MSG") == "1"
 MSG_HILFETEXT = os.getenv("MSG_HILFETEXT", "Kein Hilfetext konfiguriert.")
 
-# Pfade
 STATE_FILE = "state.json"
 LOG_FILE = "event_log.txt"
 
@@ -35,8 +41,7 @@ LOG_FILE = "event_log.txt"
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+        with open(STATE_FILE, "r") as f: return json.load(f)
     return {
         "event_id": None, "event_title": "Kein Event", "event_datetime": "",
         "drivers": [], "driver_status": {}, "manual_grids": None,
@@ -45,8 +50,7 @@ def load_state():
     }
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=4)
+    with open(STATE_FILE, "w") as f: json.dump(state, f, indent=4)
 
 def get_timestamp():
     days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -66,7 +70,7 @@ async def discord_request(method, url, token, json_data=None):
                 return await resp.json() if resp.status != 204 else True
             return None
 
-# --- BEFEHLSVERARBEITUNG (Block 11) ---
+# --- BLOCK 10 & 11: BEFEHLE & CLEANUP ---
 
 async def handle_commands(state):
     url = f"https://discord.com/api/v10/channels/{CHAN_ORDERS}/messages?limit=10"
@@ -94,23 +98,22 @@ async def handle_commands(state):
                     state["driver_status"] = {}; state["drivers"] = []
                     write_to_log(f"⚠️ Cleanlog durch {u_name}")
                 elif content == "!cleancodes":
-                    await run_lobby_cleanup(state); write_to_log(f"⚙️ Lobby-Bereinigung durch {u_name}")
+                    await run_lobby_cleanup(); write_to_log(f"⚙️ Lobby-Bereinigung durch {u_name}")
                 elif content == "!cleanchannel":
                     state["active_log_id"] = None; write_to_log(f"🧹 Channel bereinigt von {u_name}")
             
-            # Hygiene (Block 11.1)
             await discord_request("DELETE", f"{url}/{msg['id']}", TOKEN_APOLLO)
 
-async def run_lobby_cleanup(state):
+async def run_lobby_cleanup():
     url = f"https://discord.com/api/v10/channels/{CHAN_CODES}/messages"
     msgs = await discord_request("GET", url, TOKEN_LOBBY)
     if msgs:
         for m in msgs: await discord_request("DELETE", f"{url}/{m['id']}", TOKEN_LOBBY)
     await discord_request("POST", url, TOKEN_LOBBY, {"content": os.getenv("MSG_LOBBYCODES", "Lobbycodes bereit.")})
 
-# --- HAUPTPROZESS ---
+# --- BLOCK 2-9: HAUPTLOGIK ---
 
-async def main():
+async def main_cycle():
     state = load_state()
     await handle_commands(state)
     
@@ -120,36 +123,28 @@ async def main():
 
     apollo_msg = messages[0]
     embed = apollo_msg.get('embeds', [{}])[0]
-    curr_id = apollo_msg['id']
-    curr_title = embed.get('title', 'Event')
+    curr_id, curr_title = apollo_msg['id'], embed.get('title', 'Event')
     
-    # New Event Check (Block 2.4)
     if state["event_id"] != curr_id:
         state.update({"event_id": curr_id, "event_title": curr_title, "manual_grids": None, "grids_locked": False, "sunday_msg_sent": False, "driver_status": {}})
         if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
         write_to_log("New Event")
-        await run_lobby_cleanup(state)
+        await run_lobby_cleanup()
 
-    # Multi-Column Parsing (Block 2.5)
     curr_drivers = []
-    fields = embed.get('fields', [])
-    for field in fields[1:]: # Skip Header
-        lines = field['value'].split('\n')
-        for l in lines:
+    for field in embed.get('fields', [])[1:]:
+        for l in field['value'].split('\n'):
             name = l.replace(">>>", "").strip()
             if name: curr_drivers.append(name)
 
-    # Grid Logik (Block 8)
     now = datetime.datetime.now()
-    if now.weekday() == 6 and now.hour >= 18: state["grids_locked"] = True # Sunday 18h
+    if now.weekday() == 6 and now.hour >= 18: state["grids_locked"] = True
     
-    if state["manual_grids"] is not None: grid_count = state["manual_grids"]
-    else: grid_count = min(-(-len(curr_drivers) // DRIVERS_PER_GRID), MAX_GRIDS) if not state["grids_locked"] else state["last_grid_count"]
-    
-    state["last_grid_count"] = grid_count
-    cap = grid_count * DRIVERS_PER_GRID
+    grid_count = state["manual_grids"] if state["manual_grids"] is not None else (
+        min(-(-len(curr_drivers) // DRIVERS_PER_GRID), MAX_GRIDS) if not state["grids_locked"] else state["last_grid_count"]
+    )
+    state["last_grid_count"], cap = grid_count, grid_count * DRIVERS_PER_GRID
 
-    # Delta & Status (Block 6)
     added = [d for d in curr_drivers if d not in state["drivers"]]
     removed = [d for d in state["drivers"] if d not in curr_drivers]
 
@@ -158,24 +153,19 @@ async def main():
             status = "grid" if len([s for s in state["driver_status"].values() if s == "grid"]) < cap else "waitlist"
             state["driver_status"][d] = status
             write_to_log(f"{'🟢' if status=='grid' else '🟡'} {d.replace('\\','')} {'(auf Warteliste)' if status=='waitlist' else ''}")
-        
         for d in removed:
             write_to_log(f"🔴 {d.replace('\\','')}")
             state["driver_status"].pop(d, None)
-            # Nachrücker (Blau)
             for dr, st in state["driver_status"].items():
                 if st == "waitlist" and len([s for s in state["driver_status"].values() if s == "grid"]) < cap:
                     state["driver_status"][dr] = "grid"
-                    write_to_log(f"🔵 {dr.replace('\\','')} (zurück von Warteliste)")
-                    break
+                    write_to_log(f"🔵 {dr.replace('\\','')} (zurück von Warteliste)"); break
 
-        # Webhook (Block 3)
         payload = {"type": "update", "driver_count": len(curr_drivers), "drivers": curr_drivers, "grids": grid_count, "grid_status": "locked" if state["grids_locked"] else "open", "log_history": open(LOG_FILE, "r").read(), "timestamp": now.isoformat()}
         async with aiohttp.ClientSession() as s: 
             await s.post(MAKE_WEBHOOK, json=payload)
             state["last_sync_make"] = now.strftime("%H:%M")
 
-    # Discord Log (Block 4 & 7)
     await update_discord_display(state, grid_count, cap)
     state["drivers"] = curr_drivers
     save_state(state)
@@ -193,7 +183,20 @@ async def update_discord_display(state, grids, cap):
     if state["active_log_id"]:
         if not await discord_request("PATCH", f"{l_url}/{state['active_log_id']}", TOKEN_APOLLO, {"content": body}): state["active_log_id"] = None
     if not state["active_log_id"]:
-        await discord_request("POST", l_url, TOKEN_APOLLO, {"content": body}) # simplified cleanup
+        new_msg = await discord_request("POST", l_url, TOKEN_APOLLO, {"content": body})
+        if new_msg: state["active_log_id"] = new_msg['id']
+
+# --- BLOCK 12: EXECUTION LOOP ---
+
+async def run_forever():
+    print("Apollo Grabber V2 Loop gestartet...")
+    while True:
+        try:
+            await main_cycle()
+        except Exception as e:
+            print(f"Fehler im Zyklus: {e}")
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.run(run_forever())
