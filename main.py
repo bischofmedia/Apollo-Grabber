@@ -36,13 +36,11 @@ app = Flask(__name__)
 # BLOCK 2: HILFSFUNKTIONEN
 # ==============================================================================
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
-
 def format_ts_short(dt_obj):
     days = {"Mon":"Mo", "Tue":"Di", "Wed":"Mi", "Thu":"Do", "Fri":"Fr", "Sat":"Sa", "Sun":"So"}
     raw = dt_obj.strftime("%a %H:%M")
     for en, de in days.items(): raw = raw.replace(en, de)
     return raw
-
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
 
@@ -88,7 +86,7 @@ def send_combined_news(conf, key_base, **kwargs):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": full_text})
 
 # ==============================================================================
-# BLOCK 4: CLEANUP-LOGIK
+# BLOCK 4: CLEANUP
 # ==============================================================================
 def news_cleanup(conf):
     if not conf["ENABLE_NEWS_CLEAN"] or not conf["CHAN_NEWS"]: return
@@ -169,7 +167,7 @@ def send_order_feedback(conf, text):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 # ==============================================================================
-# BLOCK 6: HAUPT-LOGIK (V133 - Fix Doppeltes Log & Lange Liste)
+# BLOCK 6: HAUPT-LOGIK (V134 - Zweisprachigkeit FIX)
 # ==============================================================================
 @app.route('/')
 def home():
