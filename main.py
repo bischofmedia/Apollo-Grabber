@@ -36,11 +36,13 @@ app = Flask(__name__)
 # BLOCK 2: HILFSFUNKTIONEN
 # ==============================================================================
 def get_now(): return datetime.datetime.now(BERLIN_TZ)
+
 def format_ts_short(dt_obj):
     days = {"Mon":"Mo", "Tue":"Di", "Wed":"Mi", "Thu":"Do", "Fri":"Fr", "Sat":"Sa", "Sun":"So"}
     raw = dt_obj.strftime("%a %H:%M")
     for en, de in days.items(): raw = raw.replace(en, de)
     return raw
+
 def clean_for_log(n): return n.replace("\\", "").replace(">>>", "").replace(">", "").strip()
 def raw_for_make(n): return n.replace(">>>", "").replace(">", "").strip()
 
@@ -86,7 +88,7 @@ def send_combined_news(conf, key_base, **kwargs):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": full_text})
 
 # ==============================================================================
-# BLOCK 4: CLEANUP
+# BLOCK 4: CLEANUP-LOGIK
 # ==============================================================================
 def news_cleanup(conf):
     if not conf["ENABLE_NEWS_CLEAN"] or not conf["CHAN_NEWS"]: return
@@ -116,7 +118,7 @@ def lobby_cleanup(conf):
     if conf["MSG_LOBBY"]: requests.post(url, headers=h, json={"content": conf["MSG_LOBBY"]})
 
 # ==============================================================================
-# BLOCK 5: COMMANDS (Mit Namensnennung)
+# BLOCK 5: COMMANDS (Namensnennung & ID-Rettung)
 # ==============================================================================
 def process_discord_commands(conf, state):
     target_chan = conf["CHAN_ORDERS"] or conf["CHAN_LOG"]
@@ -145,7 +147,6 @@ def process_discord_commands(conf, state):
                     if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
                     if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
                     force_reset = True
-                    send_order_feedback(conf, f"🧹 **Kaltstart:** {user_name} hat alle Daten gelöscht.")
                 elif content == "!sync":
                     force_sync = True
                     send_order_feedback(conf, f"🔄 **Sync:** {user_name} hat die Übertragung ausgelöst.")
@@ -168,17 +169,19 @@ def send_order_feedback(conf, text):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 # ==============================================================================
-# BLOCK 6: HAUPT-LOGIK (V132 - Zweisprachig & Fixes)
+# BLOCK 6: HAUPT-LOGIK (V133 - Fix Doppeltes Log & Lange Liste)
 # ==============================================================================
 @app.route('/')
 def home():
     conf = get_env_config()
     state = load_state()
     now = get_now()
+    old_log_id = state.get("active_log_id")
+    
     force_reset, force_sync = process_discord_commands(conf, state)
     
     if force_reset:
-        state = {"event_id": None, "drivers": [], "last_make_sync": None, "event_title": "Unbekannt", "manual_grids": None, "active_log_id": state.get("active_log_id"), "last_cap": 0}
+        state = {"event_id": None, "drivers": [], "last_make_sync": None, "event_title": "Unbekannt", "manual_grids": None, "active_log_id": old_log_id, "last_cap": 0}
 
     should_reset_data = (now.weekday() == 1 and now.hour == 9 and now.minute == 59) or force_reset
 
