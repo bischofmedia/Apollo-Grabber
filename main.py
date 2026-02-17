@@ -515,6 +515,7 @@ def home():
             lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} Event gestartet\n")
+            # State komplett neu aufsetzen
             state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": None, "last_cap": 0}
             save_state(state)
 
@@ -530,25 +531,33 @@ def home():
         grids = state.get("manual_grids") if is_locked else min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
         current_cap = grids * conf["DRIVERS_PER_GRID"]
         
-        added = [d for d in drivers if d not in state.get("drivers", [])]
-        removed = [d for d in state.get("drivers", []) if d not in drivers]
+        # WICHTIG: Vergleichsbasis laden
+        old_drivers = state.get("drivers", [])
+        added = [d for d in drivers if d not in old_drivers]
+        removed = [d for d in old_drivers if d not in drivers]
         
         new_log_entries = []
-        # Wenn neu gestartet wurde oder State leer war, alle aktuellen Fahrer sofort loggen
-        if should_reset_data or not state.get("drivers"):
+        
+        # LOGIK-FIX: Wenn der State leer ist (nach !clean), behandle alle Fahrer als 'added'
+        # aber ohne News-Spam zu triggern.
+        if not old_drivers and drivers:
             for d in drivers:
                 idx = drivers.index(d)
                 icon = "🟡" if idx >= current_cap else "🟢"
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
         else:
+            # Normaler Betrieb: Nur echte Änderungen loggen
             for d in added:
                 idx = drivers.index(d)
                 icon = "🟡" if idx >= current_cap else "🟢"
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
                 if idx >= current_cap and conf["SW_WAIT"]:
                     send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
-            for d in removed: new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
+            
+            for d in removed:
+                new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
 
+            # Cap-Wechsel (Nachrücken/Warteliste)
             old_cap = state.get("last_cap", 0)
             if current_cap != old_cap and old_cap > 0:
                 moved_to_wait, moved_to_grids = [], []
@@ -572,6 +581,7 @@ def home():
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for entry in new_log_entries: f.write(entry + "\n")
 
+        # Make.com Sync
         if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data or current_cap != state.get("last_cap") or force_sync):
             payload = {"type": "event_reset" if should_reset_data else "update", "driver_count": count, "drivers": [raw_for_make(d) for d in drivers], "grids": grids, "log_history": "\n".join(read_persistent_log()), "timestamp": now.isoformat()}
             try:
@@ -579,12 +589,22 @@ def home():
                 if m_res.ok: state["last_make_sync"] = now.isoformat()
             except: pass
 
+        # --- INTELLIGENTE LOG-KÜRZUNG ---
+        full_log = read_persistent_log()
+        display_log = ""
+        max_chars = 1200
+        for entry in reversed(full_log):
+            if len(display_log) + len(entry) + 5 > max_chars:
+                display_log = "[...]\n" + display_log
+                break
+            display_log = entry + "\n" + display_log
+
         icon_stat, txt_stat = ("🟢", "Anmeldung geöffnet") if count < current_cap else ("🟡", "Warteliste aktiv")
         sync_time = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else "--"
         grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
         
         log_content = (f"**{event_title}**\n{icon_stat} **{txt_stat}**\nFahrer: `{count}` | Grids: `{grid_display}`\n"
-                       f"```\n" + "\n".join(read_persistent_log()[-15:]) + "```\n"
+                       f"```\n{display_log}```\n"
                        f"*Stand: {format_ts_short(now)} | Sync: {sync_time}*")
         
         active_id = state.get("active_log_id")
@@ -625,6 +645,9 @@ def render_dashboard(state, count, grids, is_locked):
             </div>
             <div style="background:#1e1e1e; color:#00ff00; padding:15px; margin-top:20px; height:450px; overflow-y:auto; font-family:monospace;">{log_html}</div>
         </div></body></html>"""
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 # ==============================================================================
 # BLOCK 8: SERVER START
