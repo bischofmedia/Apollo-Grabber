@@ -132,7 +132,7 @@ def home():
         event_title = embed.get("title", "Event")
         is_new = (state["event_id"] is None or state["event_id"] != apollo_msg["id"])
         
-        # --- RESET BEI NEUEM EVENT ---
+# --- RESET BEI NEUEM EVENT (V103) ---
         if is_new:
             if now.weekday() == 1 or state["event_id"] is None:
                 news_cleanup(conf)
@@ -142,9 +142,18 @@ def home():
             with open(LOG_FILE, "w", encoding="utf-8") as f: 
                 f.write(f"{format_ts_short(now)} Event gestartet\n")
             
+            # Webhook an Make für Tabellen-Reset
+            if conf["MAKE_WEBHOOK"]:
+                payload = {
+                    "type": "event_reset", 
+                    "event_title": event_title,
+                    "timestamp": now.isoformat()
+                }
+                requests.post(conf["MAKE_WEBHOOK"], json=payload)
+
             state = {
                 "event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], 
-                "last_make_sync": None, "sun_msg_sent": False, "extra_msg_sent": False, 
+                "last_make_sync": now.isoformat(), "sun_msg_sent": False, "extra_msg_sent": False, 
                 "manual_grids": None, "frozen_grids": None
             }
             save_state(state)
