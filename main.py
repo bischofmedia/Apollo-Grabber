@@ -499,17 +499,22 @@ def home():
         embed = apollo_msg["embeds"][0]
         event_title = embed.get("title", "Event")
 
-        # Falls Log-Datei fehlt oder Reset gefordert: Neu anlegen
-        if should_reset_data or not os.path.exists(LOG_FILE):
+        # 1. INITIALISIERUNG BEI RESET ODER FEHLENDEM LOG
+        is_fresh_start = should_reset_data or not os.path.exists(LOG_FILE)
+        
+        if is_fresh_start:
             if should_reset_data:
                 news_cleanup(conf)
                 lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: 
                 f.write(f"{format_ts_short(now)} Event gestartet\n")
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": state.get("active_log_id"), "last_cap": 0}
+            # State leeren, aber active_log_id behalten falls vorhanden
+            curr_log_id = state.get("active_log_id")
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": curr_log_id, "last_cap": 0}
             save_state(state)
 
+        # 2. FAHRER AUSLESEN
         drivers = []
         for f in embed.get("fields", []):
             if any(k in f.get("name", "").lower() for k in ["accepted", "confirmed", "anmeldung"]):
@@ -523,28 +528,31 @@ def home():
         current_cap = grids * conf["DRIVERS_PER_GRID"]
         
         old_drivers = state.get("drivers", [])
-        added = [d for d in drivers if d not in old_drivers]
-        removed = [d for d in old_drivers if d not in drivers]
-        
         new_log_entries = []
-        
-        # FIX: Wenn die Fahrerliste im State noch leer ist (Kaltstart), logge alle vorhandenen Fahrer
-        if not old_drivers and drivers:
+
+        # 3. LOG-BEFÜLLUNG (ENTWEDER KALTSTART ODER DELTA)
+        if is_fresh_start and drivers:
+            # Bei Kaltstart/Clean: Sofort alle als gelistet markieren
             for d in drivers:
                 idx = drivers.index(d)
                 icon = "🟡" if idx >= current_cap else "🟢"
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
         else:
+            # Normaler Delta-Vergleich
+            added = [d for d in drivers if d not in old_drivers]
+            removed = [d for d in old_drivers if d not in drivers]
+            
             for d in added:
                 idx = drivers.index(d)
                 icon = "🟡" if idx >= current_cap else "🟢"
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
                 if idx >= current_cap and conf["SW_WAIT"]:
                     send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
+            
             for d in removed:
                 new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
 
-            # Cap-Handling (Nachrücken/Warteliste)
+            # Cap-Wechsel Logik
             old_cap = state.get("last_cap", 0)
             if current_cap != old_cap and old_cap > 0:
                 moved_to_wait, moved_to_grids = [], []
@@ -563,19 +571,20 @@ def home():
                     if moved_to_grids and conf["SW_MOVE"]:
                         send_combined_news(conf, "MSG_MOVED_UP_MULTI" if len(moved_to_grids)>1 else "MSG_MOVED_UP_SINGLE", driver_names=", ".join(moved_to_grids))
 
+        # 4. SCHREIBEN UND SYNC
         if new_log_entries:
             with LOG_LOCK:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for entry in new_log_entries: f.write(entry + "\n")
 
-        if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data or current_cap != state.get("last_cap") or force_sync):
+        if conf["MAKE_WEBHOOK"] and (new_log_entries or should_reset_data or current_cap != state.get("last_cap") or force_sync):
             payload = {"type": "event_reset" if should_reset_data else "update", "driver_count": count, "drivers": [raw_for_make(d) for d in drivers], "grids": grids, "log_history": "\n".join(read_persistent_log()), "timestamp": now.isoformat()}
             try:
                 m_res = requests.post(conf["MAKE_WEBHOOK"], json=payload, timeout=10)
                 if m_res.ok: state["last_make_sync"] = now.isoformat()
             except: pass
 
-        # Dynamisches Log-Management (Intelligente Kürzung)
+        # 5. LOG-DISPLAY GENERIERUNG
         full_log = read_persistent_log()
         display_log = ""
         max_chars = 1200
@@ -593,6 +602,7 @@ def home():
                        f"```\n{display_log}```\n"
                        f"*Stand: {format_ts_short(now)} | Sync: {sync_time}*")
         
+        # 6. DISCORD SENDEN/PATCHEN
         active_id = state.get("active_log_id")
         log_url = f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages"
         log_reachable = False
