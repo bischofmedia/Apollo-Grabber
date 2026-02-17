@@ -17,7 +17,6 @@ def get_env_config():
         "USER_ORGA": [c_id(u) for u in e.get("USER_ID_ORGA", "").split(";") if u.strip()],
         "DRIVERS_PER_GRID": int(e.get("DRIVERS_PER_GRID", 15)),
         "MAX_GRIDS": int(e.get("MAX_GRIDS", 4)),
-        "MANUAL_LOG_ID": c_id(e.get("SET_MANUAL_LOG_ID")),
         "ENABLE_NEWS_CLEAN": e.get("ENABLE_NEWS_CLEANUP") == "1",
         "SW_MOVE": e.get("SET_MSG_MOVED_UP_TEXT") == "1",
         "SW_WAIT": e.get("ENABLE_WAITLIST_MSG") == "1",
@@ -88,23 +87,17 @@ def send_order_feedback(conf, text):
                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 # --- CLEANUP ---
-def news_cleanup(conf, state_log_id):
+def news_cleanup(conf):
     if not conf["ENABLE_NEWS_CLEAN"] or not conf["CHAN_NEWS"]: return
     my_id = get_bot_user_id(conf["TOKEN_APOLLO"])
     if not my_id: return
     h = {"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}
     url = f"https://discord.com/api/v10/channels/{conf['CHAN_NEWS']}/messages"
     res = requests.get(f"{url}?limit=100", headers=h)
-    
-    # Absoluter Schutz der IDs
-    protected = [str(conf["MANUAL_LOG_ID"]), str(state_log_id)]
-    
     if res.ok:
         for m in res.json():
-            mid = str(m.get("id"))
-            if mid in protected: continue
             if str(m.get("author", {}).get("id")) == my_id:
-                requests.delete(f"{url}/{mid}", headers=h)
+                requests.delete(f"{url}/{m['id']}", headers=h)
                 time.sleep(0.3)
 
 def lobby_cleanup(conf):
@@ -150,10 +143,12 @@ def process_discord_commands(conf, state):
                     send_order_feedback(conf, help_msg)
                 
                 elif content == "!clean":
-                    news_cleanup(conf, state.get("active_log_id"))
+                    news_cleanup(conf)
                     lobby_cleanup(conf)
+                    state["active_log_id"] = None # Log-ID im State nullen für Neuerstellung
                     force_reset = True
                     send_order_feedback(conf, f"🧹 **Manuelle Säuberung:** {user_name} hat den Cleanup gestartet.")
+                    save_state(state)
                 
                 elif content == "!newevent":
                     force_reset = True
@@ -181,13 +176,6 @@ def home():
     state = load_state()
     now = get_now()
     
-    target_log_id = conf["MANUAL_LOG_ID"] or state.get("active_log_id")
-    log_exists = False
-    if target_log_id:
-        res_log = requests.get(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{target_log_id}", 
-                               headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"})
-        if res_log.ok: log_exists = True
-
     is_tuesday = (now.weekday() == 1 and now.hour == 9 and now.minute == 59)
     force_reset = process_discord_commands(conf, state)
     should_reset_data = is_tuesday or force_reset
@@ -202,11 +190,11 @@ def home():
         event_title = embed.get("title", "Event")
 
         if should_reset_data:
-            news_cleanup(conf, target_log_id)
+            news_cleanup(conf)
             lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} Event gestartet\n")
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": target_log_id, "last_cap": 0}
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": None, "last_cap": 0}
             save_state(state)
 
         drivers = []
@@ -267,6 +255,7 @@ def home():
                 if m_res.ok: state["last_make_sync"] = now.isoformat()
             except: pass
 
+        # --- DYNAMISCHES LOG-MANAGEMENT ---
         icon_stat, txt_stat = ("🟢", "Anmeldung geöffnet") if count < current_cap else ("🟡", "Warteliste aktiv")
         sync_time = format_ts_short(datetime.datetime.fromisoformat(state['last_make_sync'])) if state.get('last_make_sync') else "--"
         grid_display = f"{grids} 🔒" if is_locked else f"{grids}"
@@ -277,13 +266,22 @@ def home():
             f"*Stand: {format_ts_short(now)} | Sync: {sync_time}*"
         )
         
-        if not log_exists:
-            new_log = requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages", 
-                                   headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
+        active_id = state.get("active_log_id")
+        log_url = f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages"
+        
+        # Check ob Nachricht noch existiert
+        log_reachable = False
+        if active_id:
+            res_check = requests.get(f"{log_url}/{active_id}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"})
+            if res_check.ok: log_reachable = True
+
+        if not log_reachable:
+            # Neues Log posten
+            new_log = requests.post(log_url, headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
             if new_log.ok: state["active_log_id"] = new_log.json()['id']
         else:
-            requests.patch(f"https://discord.com/api/v10/channels/{conf['CHAN_LOG']}/messages/{target_log_id}", 
-                           headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
+            # Bestehendes Log updaten
+            requests.patch(f"{log_url}/{active_id}", headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": log_content})
 
         state["drivers"] = drivers
         state["last_cap"] = current_cap
