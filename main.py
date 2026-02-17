@@ -444,48 +444,37 @@ def process_discord_commands(conf, state):
                     help_msg = (
                         f"**🛠️ RTC Apollo Grabber V2 - Befehlsübersicht** (Aufruf durch {user_name})\n\n"
                         "`!grids=X` : Setzt die Gridanzahl manuell fest (z.B. `!grids=3`).\n"
-                        "            *Hinweis: `!grids=0` hebt die Sperre auf und aktiviert die Automatik.*\n"
-                        "`!clean`   : Löscht alle eigenen Nachrichten im News-Kanal, bereinigt die Lobby-Codes und setzt die Make.com-Tabelle zurück.\n"
-                        "`!sync`    : Erzwingt eine sofortige Datenübertragung an Make.com.\n"
-                        "`!newevent`: Erzwingt einen sofortigen Reset aller Daten und startet die Protokollierung für das aktuelle Apollo-Event neu."
+                        "`!clean`   : KOMPLETTER RESET. Löscht Logs, State-Datei und bereinigt Kanäle.\n"
+                        "`!sync`    : Erzwingt sofortige Übertragung an Make.com.\n"
+                        "`!newevent`: Startet das Protokoll für das aktuelle Event neu."
                     )
                     send_order_feedback(conf, help_msg)
                 
                 elif content == "!clean":
                     news_cleanup(conf)
                     lobby_cleanup(conf)
-                    # Physisches Löschen der State-Datei für echten Kaltstart beim nächsten Home-Aufruf
+                    # Absolute Säuberung: State und Log-Datei physisch entfernen
                     if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
+                    if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
                     force_reset = True
-                    send_order_feedback(conf, f"🧹 **Vollständiger Reset:** {user_name} hat Kanäle bereinigt und die State-Datei gelöscht.")
+                    send_order_feedback(conf, f"🧹 **Kaltstart:** {user_name} hat alle Daten (State & Log) gelöscht.")
                 
                 elif content == "!sync":
                     force_sync = True
-                    send_order_feedback(conf, f"🔄 **Manueller Sync:** {user_name} hat die Übertragung an Make.com ausgelöst.")
+                    send_order_feedback(conf, f"🔄 **Sync:** {user_name} hat Make.com-Übertragung ausgelöst.")
                 
                 elif content == "!newevent":
                     force_reset = True
-                    send_order_feedback(conf, f"🔄 **Event-Neustart:** {user_name} hat einen Reset erzwungen.")
+                    send_order_feedback(conf, f"🔄 **Reset:** {user_name} hat einen Reset erzwungen.")
                 
                 elif content.startswith("!grids="):
                     try:
                         val = int(content.split("=")[1])
-                        if val == 0:
-                            state["manual_grids"] = None
-                            send_order_feedback(conf, f"🔓 **Grid-Sperre aufgehoben:** {user_name} hat die Automatik aktiviert.")
-                        else:
-                            final_val = min(val, conf["MAX_GRIDS"])
-                            state["manual_grids"] = final_val
-                            limit = f" (begrenzt auf {conf['MAX_GRIDS']})" if val > conf["MAX_GRIDS"] else ""
-                            send_order_feedback(conf, f"🔒 **Grid-Sperre aktiv:** {user_name} hat `{final_val}` Grids gesetzt{limit}.")
+                        state["manual_grids"] = None if val == 0 else min(val, conf["MAX_GRIDS"])
                         save_state(state)
+                        send_order_feedback(conf, f"🔒 **Grids:** Auf {state['manual_grids'] or 'Auto'} gesetzt.")
                     except: pass
     return force_reset, force_sync
-
-def send_order_feedback(conf, text):
-    if not conf["CHAN_ORDERS"]: return
-    requests.post(f"https://discord.com/api/v10/channels/{conf['CHAN_ORDERS']}/messages", 
-                  headers={"Authorization": f"Bot {conf['TOKEN_APOLLO']}"}, json={"content": text})
 
 
 # ==============================================================================
@@ -510,13 +499,15 @@ def home():
         embed = apollo_msg["embeds"][0]
         event_title = embed.get("title", "Event")
 
-        if should_reset_data:
-            news_cleanup(conf)
-            lobby_cleanup(conf)
+        # Falls Log-Datei fehlt oder Reset gefordert: Neu anlegen
+        if should_reset_data or not os.path.exists(LOG_FILE):
+            if should_reset_data:
+                news_cleanup(conf)
+                lobby_cleanup(conf)
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-            with open(LOG_FILE, "w", encoding="utf-8") as f: f.write(f"{format_ts_short(now)} Event gestartet\n")
-            # State komplett neu aufsetzen
-            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": None, "last_cap": 0}
+            with open(LOG_FILE, "w", encoding="utf-8") as f: 
+                f.write(f"{format_ts_short(now)} Event gestartet\n")
+            state = {"event_id": apollo_msg["id"], "event_title": event_title, "drivers": [], "last_make_sync": None, "manual_grids": None, "active_log_id": state.get("active_log_id"), "last_cap": 0}
             save_state(state)
 
         drivers = []
@@ -531,33 +522,29 @@ def home():
         grids = state.get("manual_grids") if is_locked else min(math.ceil(count / conf["DRIVERS_PER_GRID"]), conf["MAX_GRIDS"])
         current_cap = grids * conf["DRIVERS_PER_GRID"]
         
-        # WICHTIG: Vergleichsbasis laden
         old_drivers = state.get("drivers", [])
         added = [d for d in drivers if d not in old_drivers]
         removed = [d for d in old_drivers if d not in drivers]
         
         new_log_entries = []
         
-        # LOGIK-FIX: Wenn der State leer ist (nach !clean), behandle alle Fahrer als 'added'
-        # aber ohne News-Spam zu triggern.
+        # FIX: Wenn die Fahrerliste im State noch leer ist (Kaltstart), logge alle vorhandenen Fahrer
         if not old_drivers and drivers:
             for d in drivers:
                 idx = drivers.index(d)
                 icon = "🟡" if idx >= current_cap else "🟢"
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
         else:
-            # Normaler Betrieb: Nur echte Änderungen loggen
             for d in added:
                 idx = drivers.index(d)
                 icon = "🟡" if idx >= current_cap else "🟢"
                 new_log_entries.append(f"{format_ts_short(now)} {icon} {clean_for_log(d)}{' (Waitlist)' if idx >= current_cap else ''}")
                 if idx >= current_cap and conf["SW_WAIT"]:
                     send_combined_news(conf, "MSG_WAITLIST_SINGLE", driver_names=clean_for_log(d))
-            
             for d in removed:
                 new_log_entries.append(f"{format_ts_short(now)} 🔴 {clean_for_log(d)}")
 
-            # Cap-Wechsel (Nachrücken/Warteliste)
+            # Cap-Handling (Nachrücken/Warteliste)
             old_cap = state.get("last_cap", 0)
             if current_cap != old_cap and old_cap > 0:
                 moved_to_wait, moved_to_grids = [], []
@@ -581,7 +568,6 @@ def home():
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     for entry in new_log_entries: f.write(entry + "\n")
 
-        # Make.com Sync
         if conf["MAKE_WEBHOOK"] and (added or removed or should_reset_data or current_cap != state.get("last_cap") or force_sync):
             payload = {"type": "event_reset" if should_reset_data else "update", "driver_count": count, "drivers": [raw_for_make(d) for d in drivers], "grids": grids, "log_history": "\n".join(read_persistent_log()), "timestamp": now.isoformat()}
             try:
@@ -589,7 +575,7 @@ def home():
                 if m_res.ok: state["last_make_sync"] = now.isoformat()
             except: pass
 
-        # --- INTELLIGENTE LOG-KÜRZUNG ---
+        # Dynamisches Log-Management (Intelligente Kürzung)
         full_log = read_persistent_log()
         display_log = ""
         max_chars = 1200
